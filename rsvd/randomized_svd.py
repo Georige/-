@@ -1,39 +1,59 @@
-# 文件名: randomized_svd.py
-
 import numpy as np
 import time
+from typing import Tuple, Union, List
 
 # --- 模块化导入 ---
-# 我们从 core_utils 模块中导入上一节课写的函数
-# 确保 core_utils.py 和当前文件在同一目录下
 try:
     from adaptive_range_finder import adaptive_randomized_range_finder
 except ImportError:
     print("错误: 找不到 core_utils.py。请确保上一段代码已保存为该文件名。")
     exit(1)
 
-def randomized_svd(A: np.ndarray, epsilon: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def randomized_svd(
+    data: np.ndarray, 
+    epsilon: float
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    实现算法 5.1: 直接随机化 SVD (Direct SVD)。
+    实现算法 5.1: 直接随机化 SVD (支持 2D 矩阵和 3D 张量)。
     
-    利用 Range Finder 得到的 Q，将 A 分解为 U, S, Vt。
-    A \approx U * diag(S) * Vt
+    如果是 3D 张量 (C, H, W)，会自动展平为 (C*H, W) 进行计算，
+    并在返回时尝试还原 U 的维度。
     
     参数:
-        A (np.ndarray): 输入矩阵 (m, n)。
-        epsilon (float): 传递给 Range Finder 的容差。
+        data (np.ndarray): 输入数据，形状可以是 (m, n) 或 (c, h, w)。
+        epsilon (float): 容差阈值。
         
     返回:
-        U (np.ndarray): 左奇异向量 (m, k)。
-        S (np.ndarray): 奇异值 (k,)。
-        Vt (np.ndarray): 右奇异向量 (k, n)。
+        U (np.ndarray): 左奇异向量。
+        S (np.ndarray): 奇异值。
+        Vt (np.ndarray): 右奇异向量。
     """
     
+    # --- 阶段 0: 数据预处理 (张量适配) ---
+    original_shape = data.shape
+    is_3d = False
+    
+    if len(original_shape) == 3:
+        # 处理 3D 张量: (Channels, Height, Width) -> (3, 64, 64)
+        print(f"检测到 3D 输入 {original_shape}，正在执行模式转换 (Unfolding)...")
+        is_3d = True
+        c, h, w = original_shape
+        
+        # 策略: 将 (C, H, W) 展平为 (C*H, W)
+        # 也就是把每个通道的每一行都堆叠起来，形成一个“高瘦”的矩阵
+        # 形状变为 (192, 64)
+        A = data.reshape(c * h, w)
+        print(f"  >> 转换后矩阵形状: {A.shape}")
+    elif len(original_shape) == 2:
+        # 标准 2D 矩阵
+        A = data
+    else:
+        raise ValueError(f"不支持的维度: {original_shape}。仅支持 2D 或 3D 输入。")
+
     print("--- 第一阶段: 计算正交基 Q (Range Finder) ---")
     start_time = time.time()
     
-    # 1. 使用我们在另一个文件中定义的算法计算 Q
-    # Q 的形状是 (m, k)，其中 k << m
+    # 1. 计算 Q
     Q = adaptive_randomized_range_finder(A, epsilon=epsilon)
     
     k = Q.shape[1]
@@ -41,59 +61,84 @@ def randomized_svd(A: np.ndarray, epsilon: float) -> tuple[np.ndarray, np.ndarra
     print(f"  >> Range Finder 耗时: {time.time() - start_time:.4f}s")
     
     print("--- 第二阶段: 降维与小矩阵分解 ---")
-    # 2. 形成小矩阵 B
-    # 理论公式: B = Q.T * A
-    # Q.T 形状 (k, m), A 形状 (m, n) -> B 形状 (k, n)
-    # 这一步将高维问题“压缩”到了低维空间
+    # 2. 形成小矩阵 B = Q.T @ A
     B = Q.T @ A
     
-    # 3. 对小矩阵 B 进行标准的确定性 SVD
-    # 由于 B 只有 k 行 (k 通常很小)，这一步非常快
-    # np.linalg.svd 默认返回的 full_matrices=True，我们需要设为 False (economy mode)
+    # 3. 对小矩阵 B 进行标准 SVD (Economy mode)
+    # S_hat: (k, k), Sigma: (k,), Vt: (k, n)
     S_hat, Sigma, Vt = np.linalg.svd(B, full_matrices=False)
     
-    # S_hat 是 B 的左奇异向量，形状 (k, k)
-    # Sigma 是奇异值，形状 (k,)
-    # Vt 是右奇异向量，形状 (k, n) -> 这已经是我们要的最终 Vt 了！
-    
     print("--- 第三阶段: 还原高维空间 ---")
-    # 4. 计算最终的 U
-    # 我们有 A ≈ Q * B = Q * (S_hat * Sigma * Vt)
-    # 所以 U = Q * S_hat
-    # Q (m, k) @ S_hat (k, k) -> U (m, k)
+    # 4. 计算最终的 U = Q @ S_hat
+    # U 的形状目前是 (m, k)，即 (C*H, k)
     U = Q @ S_hat
     
+    # --- 阶段 4: 结果后处理 (维度还原) ---
+    if is_3d:
+        # 如果输入是 (C, H, W)，我们将 U 从 (C*H, k) 还原为 (C, H, k)
+        # 这样你可以保留空间结构信息
+        # 注意: Vt 通常保持 (k, W)，代表特征在宽度维度的分布
+        try:
+            c, h, w = original_shape
+            U_reshaped = U.reshape(c, h, k)
+            print(f"  >> 已将 U 还原为 3D 结构: {U_reshaped.shape}")
+            return U_reshaped, Sigma, Vt
+        except Exception as e:
+            print(f"  >> 警告: U 维度还原失败 ({e})，返回 2D 形式。")
+            return U, Sigma, Vt
+            
     return U, Sigma, Vt
 
-# --- 系统集成测试 ---
+# --- 系统集成测试 (针对 3D 图片数据) ---
 if __name__ == "__main__":
-    # 1. 生成测试数据 (与上次相同，保证可比性)
     np.random.seed(42)
-    m, n = 2000, 200  # 稍微加大一点数据量
-    true_rank = 15
     
-    print(f"正在生成 ({m}x{n}) 的测试矩阵，真实秩为 {true_rank}...")
-    U_true, _ = np.linalg.qr(np.random.normal(size=(m, true_rank)))
-    V_true, _ = np.linalg.qr(np.random.normal(size=(n, true_rank)))
-    S_true = np.sort(np.random.rand(true_rank))[::-1] * 10 # 奇异值
-    A = U_true @ np.diag(S_true) @ V_true.T
+    # 1. 模拟一张 (3, 64, 64) 的图片
+    # 我们故意制造一些低秩结构：背景(平滑) + 前景(物体)
+    channels, height, width = 3, 64, 64
+    print(f"\n正在生成模拟图片数据 ({channels}, {height}, {width})...")
     
+    # 创建基础模式
+    base_pattern = np.zeros((height, width))
+    for i in range(height):
+        base_pattern[i, :] = np.sin(i / 5.0)  # 简单的波纹
+        
+    img_tensor = np.zeros((channels, height, width))
+    for c in range(channels):
+        # 每个通道有些许偏移
+        img_tensor[c, :, :] = base_pattern * (c + 1) + np.random.normal(0, 0.1, (height, width))
+        
     # 2. 执行随机化 SVD
-    target_eps = 0.1
+    target_eps = 0.5 # 对于图片，容差可以稍微大一点
     print("\n开始执行 Randomized SVD...")
-    U_approx, S_approx, Vt_approx = randomized_svd(A, epsilon=target_eps)
     
-    # 3. 验证结果
-    print(f"\n结果验证:")
-    print(f"  >> 原始前5个奇异值: {S_true[:5]}")
-    print(f"  >> 计算前5个奇异值: {S_approx[:5]}")
+    # 这一步会自动处理 reshape
+    U_approx, S_approx, Vt_approx = randomized_svd(img_tensor, epsilon=target_eps)
     
-    # 验证重建误差 || A - U S Vt ||
-    A_reconstructed = U_approx @ np.diag(S_approx) @ Vt_approx
-    error = np.linalg.norm(A - A_reconstructed, ord=2)
-    print(f"  >> 谱范数误差: {error:.6f}")
+    # 3. 验证结果形状
+    print(f"\n结果分析:")
+    print(f"  >> U shape: {U_approx.shape} (预期: 3, 64, k)")
+    print(f"  >> S shape: {S_approx.shape} (预期: k)")
+    print(f"  >> Vt shape: {Vt_approx.shape} (预期: k, 64)")
     
-    if error < target_eps:
-        print("\n✅ 系统测试通过：重建精度符合要求。")
+    # 4. 尝试重建图片验证精度
+    # 重建公式: A ≈ U * S * Vt
+    # 需要注意维度的对齐: 
+    # U(3, 64, k) dot diag(S) dot Vt(k, 64)
+    # 为了计算方便，先把 U 变回 2D: (192, k)
+    k = len(S_approx)
+    U_2d = U_approx.reshape(channels * height, k)
+    
+    # 重建 2D 矩阵
+    img_reconstructed_2d = U_2d @ np.diag(S_approx) @ Vt_approx
+    
+    # 变回 3D
+    img_reconstructed = img_reconstructed_2d.reshape(channels, height, width)
+    
+    error = np.linalg.norm(img_tensor - img_reconstructed)
+    print(f"  >> 重建误差 (Frobenius Norm): {error:.4f}")
+    
+    if error < 10.0: # 图片数据的数值通常较大，误差绝对值会比之前大
+        print("\n✅ 3D Tensor 测试通过。")
     else:
-        print("\n⚠️ 系统测试警告：误差可能偏大。")
+        print("\n⚠️ 误差较大，请检查参数。")
