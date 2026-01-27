@@ -1,0 +1,247 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LassoCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import f1_score, mean_squared_error
+
+# 设置随机种子以保证可复现性
+torch.manual_seed(42)
+np.random.seed(42)
+
+# ==========================================
+# 1. 复杂数据生成器 (Complex Data Generator)
+# ==========================================
+def generate_complex_data(n_samples=1000, n_features=100):
+    """
+    生成包含线性、非线性、高维噪声的复杂数据集
+    """
+    X = np.random.uniform(-3, 3, (n_samples, n_features))
+    
+    # 构造真实响应 y (加性模型)
+    # y = f1(x1) + f2(x2) + ... + noise
+    
+    # Feature 0: Linear (Strong)
+    f0 = 3.0 * X[:, 0]
+    
+    # Feature 1: Quadratic (U-shape) - Lasso 很难捕捉
+    f1 = 2.0 * (X[:, 1] ** 2) - 4.0 # 减均值保持居中
+    
+    # Feature 2: Sinusoidal (Wavy)
+    f2 = 3.0 * np.sin(1.5 * X[:, 2])
+    
+    # Feature 3: Tanh (Saturation)
+    f3 = 4.0 * np.tanh(2.0 * X[:, 3])
+    
+    # Feature 4: Absolute (V-shape)
+    f4 = -2.5 * np.abs(X[:, 4]) + 2.0
+    
+    # Feature 5: Linear Negative
+    f5 = -2.0 * X[:, 5]
+    
+    # 合成 y，加入噪声
+    y = f0 + f1 + f2 + f3 + f4 + f5 + np.random.normal(0, 0.5, n_samples)
+    
+    # 记录真实的支持集 (True Support)
+    true_support = [0, 1, 2, 3, 4, 5]
+    
+    return X, y, true_support
+
+# ==========================================
+# 2. Neural UniLasso 模型定义
+# ==========================================
+class UnivariateNetwork(nn.Module):
+    """
+    单变量子网络：负责学习 phi_j(x_j)
+    结构：1 -> 16 -> 8 -> 1 (带激活函数)
+    """
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(1, 16),
+            nn.ELU(),           # 使用 ELU 保持平滑
+            nn.Linear(16, 8),
+            nn.ELU(),
+            nn.Linear(8, 1)     # 输出变换后的特征 z_j
+        )
+        
+    def forward(self, x):
+        return self.net(x)
+
+class NeuralUniLasso(nn.Module):
+    def __init__(self, n_features):
+        super().__init__()
+        self.n_features = n_features
+        
+        # 1. 并行特征提取层 (Parallel Univariate Layers)
+        # 为每个特征创建一个独立的神经网络
+        self.uni_nets = nn.ModuleList([UnivariateNetwork() for _ in range(n_features)])
+        
+        # 2. 稀疏融合层 (Sparse Fusion Layer)
+        # 初始化权重 (theta)
+        self.theta = nn.Parameter(torch.rand(n_features) * 0.1)
+        self.bias = nn.Parameter(torch.zeros(1))
+        
+    def forward(self, x):
+        # x shape: [batch, n_features]
+        batch_size = x.shape[0]
+        
+        # 并行处理所有特征
+        # 注意：这里用循环实现逻辑清晰，实际部署可用 Conv1d 优化速度
+        z_list = []
+        for i in range(self.n_features):
+            feat_i = x[:, i].view(-1, 1) # [batch, 1]
+            z_i = self.uni_nets[i](feat_i)
+            z_list.append(z_i)
+            
+        # 拼接 -> [batch, n_features]
+        Z = torch.cat(z_list, dim=1)
+        
+        # 强制 theta 非负 (模拟 UniLasso 的非负约束)
+        # 论文核心：Non-negative Lasso constraint
+        self.non_negative_theta = F.softplus(self.theta) 
+        
+        # 线性融合
+        y_pred = torch.matmul(Z, self.non_negative_theta) + self.bias
+        
+        return y_pred, Z, self.non_negative_theta
+
+# ==========================================
+# 3. 训练与评估流程
+# ==========================================
+def train_neural_unilasso(X, y, epochs=5000, lr=0.005, l1_lambda=0.05):
+    X_tensor = torch.FloatTensor(X)
+    y_tensor = torch.FloatTensor(y)
+    
+    model = NeuralUniLasso(n_features=X.shape[1])
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    loss_fn = nn.MSELoss()
+    
+    loss_history = []
+    
+    print(f"Training Neural UniLasso (P={X.shape[1]})...")
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        
+        y_pred, _, theta = model(X_tensor)
+        
+        # 核心 Loss = MSE + L1 Penalty (Lasso)
+        mse = loss_fn(y_pred.view(-1), y_tensor)
+        l1_reg = l1_lambda * torch.sum(theta) # 由于 theta 非负，直接求和即可
+        
+        loss = mse + l1_reg
+        loss.backward()
+        optimizer.step()
+        
+        loss_history.append(loss.item())
+        
+        if epoch % 200 == 0:
+            print(f"Epoch {epoch}: Loss={loss.item():.4f} (MSE={mse.item():.4f}, L1={l1_reg.item():.4f})")
+            
+    return model, loss_history
+
+# ==========================================
+# 4. 实验主程序
+# ==========================================
+def run_experiment():
+    # A. 数据准备
+    X, y, true_idx = generate_complex_data(n_samples=1000, n_features=50) # 50维特征
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    # 标准化 (对神经网络训练很重要)
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test = scaler.transform(X_test)
+    
+    # B. 训练 Neural UniLasso
+    neural_model, loss_hist = train_neural_unilasso(X_train, y_train, l1_lambda=0.1)
+    
+    # C. 训练 Baseline: Sklearn LassoCV
+    lasso_cv = LassoCV(cv=5, random_state=42).fit(X_train, y_train)
+    
+    # D. 评估与指标计算
+    # 1. 预测精度 MSE
+    neural_model.eval()
+    with torch.no_grad():
+        pred_neural, _, theta_neural = neural_model(torch.FloatTensor(X_test))
+        pred_neural = pred_neural.numpy().flatten()
+        theta_neural = theta_neural.numpy()
+        
+    mse_neural = mean_squared_error(y_test, pred_neural)
+    pred_lasso = lasso_cv.predict(X_test)
+    mse_lasso = mean_squared_error(y_test, pred_lasso)
+    
+    # 2. 特征选择能力 (Support Recovery)
+    # 设定一个阈值来判断系数是否为0
+    threshold = 0.1
+    support_neural = np.where(theta_neural > threshold)[0]
+    support_lasso = np.where(np.abs(lasso_cv.coef_) > threshold)[0]
+    
+    print("\n" + "="*40)
+    print("EXPERIMENTAL RESULTS SUMMARY")
+    print("="*40)
+    print(f"True Active Features: {true_idx}")
+    print(f"\n[Neural UniLasso]")
+    print(f"MSE: {mse_neural:.4f}")
+    print(f"Identified Support: {support_neural}")
+    print(f"Weights on True Features: {theta_neural[true_idx]}")
+    
+    print(f"\n[Standard Lasso]")
+    print(f"MSE: {mse_lasso:.4f}")
+    print(f"Identified Support: {support_lasso}")
+    print(f"Weights on True Features: {np.abs(lasso_cv.coef_)[true_idx]}")
+    
+    # ==========================================
+    # 5. 可视化工作 (Visualization Dashboard)
+    # ==========================================
+    plt.figure(figsize=(18, 12))
+    plt.suptitle("Neural UniLasso vs. Lasso: High-Dimensional Non-Linear Regression", fontsize=16)
+    
+    # Plot 1: Feature Importance Comparison
+    plt.subplot(2, 3, 1)
+    # Normalize weights for comparison
+    w_neural = theta_neural / np.max(theta_neural)
+    w_lasso = np.abs(lasso_cv.coef_) / np.max(np.abs(lasso_cv.coef_))
+    
+    x_idx = np.arange(len(w_neural))
+    plt.bar(x_idx, w_neural, alpha=0.6, label='Neural UniLasso', color='blue')
+    plt.bar(x_idx, -w_lasso, alpha=0.6, label='Standard Lasso', color='red')
+    plt.axhline(0, color='black', lw=1)
+    plt.xlabel("Feature Index")
+    plt.ylabel("Norm. Weight (Up=Neural, Down=Lasso)")
+    plt.title("Feature Selection Comparison")
+    plt.legend()
+    # Highlight true features
+    for idx in true_idx:
+        plt.axvline(idx, color='green', alpha=0.3, linestyle='--')
+        
+    # Plot 2: Shape Recovery (Interpretability)
+    # 我们抽取 Neural UniLasso 内部学到的变换函数 phi(x)
+    # 针对前 5 个特征 (真实有信号的)
+    feature_names = ['Linear', 'Quadratic', 'Sinusoidal', 'Tanh', 'Abs-Value']
+    
+    # 为了画出平滑曲线，我们生成一组测试输入
+    x_grid = torch.linspace(-3, 3, 100).view(-1, 1)
+    
+    for i in range(5): # 只画前5个非线性特征
+        plt.subplot(2, 3, i + 2)
+        with torch.no_grad():
+            # 通过对应的子网络
+            z_grid = neural_model.uni_nets[i](x_grid).numpy().flatten()
+        
+        plt.plot(x_grid.numpy(), z_grid, linewidth=3, color='purple')
+        plt.title(f"Learned Shape: Feature {i}\n({feature_names[i]})")
+        plt.xlabel("Input x")
+        plt.ylabel("Learned phi(x)")
+        plt.grid(True, alpha=0.3)
+        
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.show()
+
+if __name__ == "__main__":
+    run_experiment()

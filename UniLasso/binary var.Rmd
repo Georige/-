@@ -1,0 +1,574 @@
+---
+title: "binary var"
+output: html_document
+---
+
+这个实验在于检验在特征变量中如果有异质变量的情况下，UniLasso的表现如何，数值型变量+名义变量
+
+
+# n<p
+```{r}
+library(MASS)
+library(glmnet)
+library(ggplot2)
+library(gridExtra)
+library(reshape2)
+
+# ==========================================
+# 1. 异构数据工厂 (Mixed Data Factory)
+# ==========================================
+generate_mixed_data <- function(n, p_norm = 100, p_bin = 100, sigma_noise = 1) {
+  # 总特征数
+  p <- p_norm + p_bin
+  
+  # --- A. 生成正态分布数据 (连续变量) ---
+  # 均值设为 10 (非中心化)，方差为 1
+  X_norm <- matrix(rnorm(n * p_norm, mean = 10, sd = 1), n, p_norm)
+  colnames(X_norm) <- paste0("N", 1:p_norm)
+  
+  # --- B. 生成二项分布数据 (分类变量) ---
+  # B(1, 0.5) 即伯努利分布 (0 或 1)
+  X_bin <- matrix(rbinom(n * p_bin, size = 1, prob = 0.5), n, p_bin)
+  colnames(X_bin) <- paste0("B", 1:p_bin)
+  
+  # 合并特征矩阵
+  X <- cbind(X_norm, X_bin)
+  
+  # --- C. 设置真实系数 ---
+  beta_true <- rep(0, p)
+  
+  # 选择前 10 个正态变量，系数设为 2
+  idx_norm_active <- 1:10
+  beta_true[idx_norm_active] <- 2
+  
+  # 选择前 10 个二项变量 (在总矩阵中的位置是 p_norm + 1 到 p_norm + 10)
+  idx_bin_active <- (p_norm + 1):(p_norm + 10)
+  beta_true[idx_bin_active] <- 2
+  
+  # 汇总真实支持集
+  true_support <- c(idx_norm_active, idx_bin_active)
+  
+  # --- D. 生成响应变量 ---
+  # Y = X * beta + noise
+  # 注意：由于 X_norm 均值是 10，Y 的均值会非常大 (约为 10*2*10 + 0.5*2*10 = 210)
+  # 这非常考验模型的截距处理能力
+  epsilon <- rnorm(n, mean = 0, sd = sigma_noise)
+  Y <- X %*% beta_true + epsilon
+  
+  return(list(X = X, Y = Y, beta_true = beta_true, true_support = true_support))
+}
+
+# ==========================================
+# 2. 指标计算器 (通用模块)
+# ==========================================
+calc_metrics <- function(coef_vec, true_support, p, y_true, y_pred) {
+  # 移除截距
+  if(names(coef_vec)[1] == "(Intercept)") coef_vec <- coef_vec[-1]
+  active_idx <- which(coef_vec != 0)
+  
+  # 1. Support Size
+  support_size <- length(active_idx)
+  
+  # 2. Sensitivity (TPR)
+  tp <- length(intersect(active_idx, true_support))
+  sens <- tp / length(true_support)
+  
+  # 3. Specificity (TNR)
+  true_zeros <- setdiff(1:p, true_support)
+  pred_zeros <- setdiff(1:p, active_idx)
+  tn <- length(intersect(pred_zeros, true_zeros))
+  spec <- tn / length(true_zeros)
+  
+  # 4. MSE
+  mse <- mean((y_true - y_pred)^2)
+  
+  return(list(MSE = mse, Sensitivity = sens, Specificity = spec, 
+              SupportSize = support_size, SupportSet = active_idx))
+}
+
+# 稳定性计算 (Jaccard)
+calculate_pairwise_stability <- function(support_list) {
+  n_runs <- length(support_list)
+  pairs <- combn(n_runs, 2)
+  stability_scores <- apply(pairs, 2, function(idx) {
+    s1 <- support_list[[idx[1]]]
+    s2 <- support_list[[idx[2]]]
+    u <- length(union(s1, s2))
+    if(u == 0) 0 else length(intersect(s1, s2)) / u
+  })
+  return(stability_scores)
+}
+
+# ==========================================
+# 3. 批量实验主循环
+# ==========================================
+
+B <- 50
+n_train <- 100
+n_test <- 1000
+p_norm <- 100
+p_bin <- 100
+p_total <- p_norm + p_bin
+
+results_df <- data.frame()
+support_sets_uni <- list()
+support_sets_lasso <- list()
+
+cat("开始异构数据实验 (Normal + Binary, n=100, p=200)...\n")
+pb <- txtProgressBar(min = 0, max = B, style = 3)
+
+set.seed(2025)
+
+for (b in 1:B) {
+  # 1. 生成数据
+  train <- generate_mixed_data(n_train, p_norm, p_bin)
+  test <- generate_mixed_data(n_test, p_norm, p_bin)
+  
+  # 2. UniLasso
+  # 注意：glmnet 默认 standardize=TRUE，这对于混合数据至关重要，
+  # 因为 X_norm (值~10) 和 X_bin (值0/1) 尺度不同。
+  # UniLasso 默认 standardize=FALSE，但在这种情况下，如果不标准化，
+  # Lasso 阶段可能会过度惩罚数值较小的 Binary 变量。
+  # 这里我们先使用 UniLasso 的默认行为，看看它是否能自动处理好。
+  fit_uni <- cv.uniLasso(train$X, train$Y, family = "gaussian")
+  
+  coef_uni <- as.numeric(coef(fit_uni, s = "lambda.min"))
+  names(coef_uni) <- rownames(coef(fit_uni))
+  pred_uni <- predict(fit_uni, newx = test$X, s = "lambda.min")
+  
+  m_uni <- calc_metrics(coef_uni, train$true_support, p_total, test$Y, pred_uni)
+  support_sets_uni[[b]] <- m_uni$SupportSet
+  
+  # 3. Standard Lasso
+  fit_lasso <- cv.glmnet(train$X, train$Y, family = "gaussian")
+  
+  coef_lasso <- as.numeric(coef(fit_lasso, s = "lambda.min"))
+  names(coef_lasso) <- rownames(coef(fit_lasso))
+  pred_lasso <- predict(fit_lasso, newx = test$X, s = "lambda.min")
+  
+  m_lasso <- calc_metrics(coef_lasso, train$true_support, p_total, test$Y, pred_lasso)
+  support_sets_lasso[[b]] <- m_lasso$SupportSet
+  
+  # 4. 收集数据
+  tmp_df <- data.frame(
+    Run = b,
+    Method = c("UniLasso", "Lasso"),
+    MSE = c(m_uni$MSE, m_lasso$MSE),
+    Sensitivity = c(m_uni$Sensitivity, m_lasso$Sensitivity),
+    Specificity = c(m_uni$Specificity, m_lasso$Specificity),
+    SupportSize = c(m_uni$SupportSize, m_lasso$SupportSize)
+  )
+  results_df <- rbind(results_df, tmp_df)
+  
+  setTxtProgressBar(pb, b)
+}
+close(pb)
+
+# ==========================================
+# 4. 计算稳定性与后处理
+# ==========================================
+stab_uni <- calculate_pairwise_stability(support_sets_uni)
+stab_lasso <- calculate_pairwise_stability(support_sets_lasso)
+stability_df <- data.frame(
+  Stability = c(stab_uni, stab_lasso),
+  Method = rep(c("UniLasso", "Lasso"), each = length(stab_uni))
+)
+
+# ==========================================
+# 5. 可视化 (Boxplots)
+# ==========================================
+my_theme <- theme_minimal() + 
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face="bold"), axis.title.x=element_blank())
+colors_fill <- c("#E69F00", "#56B4E9")
+
+# 真实非零个数 = 20 (10 Normal + 10 Binary)
+p_size <- ggplot(results_df, aes(x = Method, y = SupportSize, fill = Method)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_hline(yintercept = 20, linetype = "dashed", color = "red") +
+  labs(title = "Support Size (True=20)", subtitle = "Includes both Normal & Binary vars") +
+  my_theme + scale_fill_manual(values = colors_fill)
+
+p_mse <- ggplot(results_df, aes(x = Method, y = MSE, fill = Method)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Test MSE") + my_theme + scale_fill_manual(values = colors_fill)
+
+p_sens <- ggplot(results_df, aes(x = Method, y = Sensitivity, fill = Method)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Sensitivity (TPR)") + my_theme + scale_fill_manual(values = colors_fill)
+
+p_spec <- ggplot(results_df, aes(x = Method, y = Specificity, fill = Method)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Specificity (TNR)") + my_theme + scale_fill_manual(values = colors_fill)
+
+p_stab <- ggplot(stability_df, aes(x = Method, y = Stability, fill = Method)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Stability (Jaccard Index)") + my_theme + scale_fill_manual(values = colors_fill)
+
+# 组合绘图
+grid.arrange(p_mse, p_size, p_sens, p_spec, p_stab, 
+             ncol = 3, nrow = 2, 
+             top = "Mixed Data Experiment: Normal(10,1) & Binary(0/1)")
+
+# ==========================================
+# 6. 数值汇总
+# ==========================================
+final_summary <- merge(aggregate(cbind(MSE, Sensitivity, Specificity, SupportSize) ~ Method, results_df, mean),
+                       aggregate(Stability ~ Method, stability_df, mean), by="Method")
+cat("\n=== 异构数据实验结果汇总 ===\n")
+print(final_summary)
+```
+
+# n>p
+
+
+```{r}
+library(MASS)
+library(glmnet)
+library(ggplot2)
+library(gridExtra)
+library(reshape2)
+
+# ==========================================
+# 1. 异构数据工厂 (Mixed Data Factory)
+# ==========================================
+generate_mixed_data <- function(n, p_norm = 100, p_bin = 100, sigma_noise = 1) {
+  # 总特征数
+  p <- p_norm + p_bin
+  
+  # --- A. 生成正态分布数据 (连续变量) ---
+  # 均值设为 10 (非中心化)，方差为 1
+  X_norm <- matrix(rnorm(n * p_norm, mean = 10, sd = 1), n, p_norm)
+  colnames(X_norm) <- paste0("N", 1:p_norm)
+  
+  # --- B. 生成二项分布数据 (分类变量) ---
+  # B(1, 0.5) 即伯努利分布 (0 或 1)
+  X_bin <- matrix(rbinom(n * p_bin, size = 1, prob = 0.5), n, p_bin)
+  colnames(X_bin) <- paste0("B", 1:p_bin)
+  
+  # 合并特征矩阵
+  X <- cbind(X_norm, X_bin)
+  
+  # --- C. 设置真实系数 ---
+  beta_true <- rep(0, p)
+  
+  # 选择前 10 个正态变量，系数设为 2
+  idx_norm_active <- 1:10
+  beta_true[idx_norm_active] <- 2
+  
+  # 选择前 10 个二项变量 (在总矩阵中的位置是 p_norm + 1 到 p_norm + 10)
+  idx_bin_active <- (p_norm + 1):(p_norm + 10)
+  beta_true[idx_bin_active] <- 2
+  
+  # 汇总真实支持集
+  true_support <- c(idx_norm_active, idx_bin_active)
+  
+  # --- D. 生成响应变量 ---
+  # Y = X * beta + noise
+  # 注意：由于 X_norm 均值是 10，Y 的均值会非常大 (约为 10*2*10 + 0.5*2*10 = 210)
+  # 这非常考验模型的截距处理能力
+  epsilon <- rnorm(n, mean = 0, sd = sigma_noise)
+  Y <- X %*% beta_true + epsilon
+  
+  return(list(X = X, Y = Y, beta_true = beta_true, true_support = true_support))
+}
+
+# ==========================================
+# 2. 指标计算器 (通用模块)
+# ==========================================
+calc_metrics <- function(coef_vec, true_support, p, y_true, y_pred) {
+  # 移除截距
+  if(names(coef_vec)[1] == "(Intercept)") coef_vec <- coef_vec[-1]
+  active_idx <- which(coef_vec != 0)
+  
+  # 1. Support Size
+  support_size <- length(active_idx)
+  
+  # 2. Sensitivity (TPR)
+  tp <- length(intersect(active_idx, true_support))
+  sens <- tp / length(true_support)
+  
+  # 3. Specificity (TNR)
+  true_zeros <- setdiff(1:p, true_support)
+  pred_zeros <- setdiff(1:p, active_idx)
+  tn <- length(intersect(pred_zeros, true_zeros))
+  spec <- tn / length(true_zeros)
+  
+  # 4. MSE
+  mse <- mean((y_true - y_pred)^2)
+  
+  return(list(MSE = mse, Sensitivity = sens, Specificity = spec, 
+              SupportSize = support_size, SupportSet = active_idx))
+}
+
+# 稳定性计算 (Jaccard)
+calculate_pairwise_stability <- function(support_list) {
+  n_runs <- length(support_list)
+  pairs <- combn(n_runs, 2)
+  stability_scores <- apply(pairs, 2, function(idx) {
+    s1 <- support_list[[idx[1]]]
+    s2 <- support_list[[idx[2]]]
+    u <- length(union(s1, s2))
+    if(u == 0) 0 else length(intersect(s1, s2)) / u
+  })
+  return(stability_scores)
+}
+
+# ==========================================
+# 3. 批量实验主循环
+# ==========================================
+
+B <- 50
+n_train <- 300
+n_test <- 1000
+p_norm <- 100
+p_bin <- 100
+p_total <- p_norm + p_bin
+
+results_df <- data.frame()
+support_sets_uni <- list()
+support_sets_lasso <- list()
+
+cat("开始异构数据实验 (Normal + Binary, n=100, p=200)...\n")
+pb <- txtProgressBar(min = 0, max = B, style = 3)
+
+set.seed(2025)
+
+for (b in 1:B) {
+  # 1. 生成数据
+  train <- generate_mixed_data(n_train, p_norm, p_bin)
+  test <- generate_mixed_data(n_test, p_norm, p_bin)
+  
+  # 2. UniLasso
+  # 注意：glmnet 默认 standardize=TRUE，这对于混合数据至关重要，
+  # 因为 X_norm (值~10) 和 X_bin (值0/1) 尺度不同。
+  # UniLasso 默认 standardize=FALSE，但在这种情况下，如果不标准化，
+  # Lasso 阶段可能会过度惩罚数值较小的 Binary 变量。
+  # 这里我们先使用 UniLasso 的默认行为，看看它是否能自动处理好。
+  fit_uni <- cv.uniLasso(train$X, train$Y, family = "gaussian")
+  
+  coef_uni <- as.numeric(coef(fit_uni, s = "lambda.min"))
+  names(coef_uni) <- rownames(coef(fit_uni))
+  pred_uni <- predict(fit_uni, newx = test$X, s = "lambda.min")
+  
+  m_uni <- calc_metrics(coef_uni, train$true_support, p_total, test$Y, pred_uni)
+  support_sets_uni[[b]] <- m_uni$SupportSet
+  
+  # 3. Standard Lasso
+  fit_lasso <- cv.glmnet(train$X, train$Y, family = "gaussian")
+  
+  coef_lasso <- as.numeric(coef(fit_lasso, s = "lambda.min"))
+  names(coef_lasso) <- rownames(coef(fit_lasso))
+  pred_lasso <- predict(fit_lasso, newx = test$X, s = "lambda.min")
+  
+  m_lasso <- calc_metrics(coef_lasso, train$true_support, p_total, test$Y, pred_lasso)
+  support_sets_lasso[[b]] <- m_lasso$SupportSet
+  
+  # 4. 收集数据
+  tmp_df <- data.frame(
+    Run = b,
+    Method = c("UniLasso", "Lasso"),
+    MSE = c(m_uni$MSE, m_lasso$MSE),
+    Sensitivity = c(m_uni$Sensitivity, m_lasso$Sensitivity),
+    Specificity = c(m_uni$Specificity, m_lasso$Specificity),
+    SupportSize = c(m_uni$SupportSize, m_lasso$SupportSize)
+  )
+  results_df <- rbind(results_df, tmp_df)
+  
+  setTxtProgressBar(pb, b)
+}
+close(pb)
+
+# ==========================================
+# 4. 计算稳定性与后处理
+# ==========================================
+stab_uni <- calculate_pairwise_stability(support_sets_uni)
+stab_lasso <- calculate_pairwise_stability(support_sets_lasso)
+stability_df <- data.frame(
+  Stability = c(stab_uni, stab_lasso),
+  Method = rep(c("UniLasso", "Lasso"), each = length(stab_uni))
+)
+
+# ==========================================
+# 5. 可视化 (Boxplots)
+# ==========================================
+my_theme <- theme_minimal() + 
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face="bold"), axis.title.x=element_blank())
+colors_fill <- c("#E69F00", "#56B4E9")
+
+# 真实非零个数 = 20 (10 Normal + 10 Binary)
+p_size <- ggplot(results_df, aes(x = Method, y = SupportSize, fill = Method)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_hline(yintercept = 20, linetype = "dashed", color = "red") +
+  labs(title = "Support Size (True=20)", subtitle = "Includes both Normal & Binary vars") +
+  my_theme + scale_fill_manual(values = colors_fill)
+
+p_mse <- ggplot(results_df, aes(x = Method, y = MSE, fill = Method)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Test MSE") + my_theme + scale_fill_manual(values = colors_fill)
+
+p_sens <- ggplot(results_df, aes(x = Method, y = Sensitivity, fill = Method)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Sensitivity (TPR)") + my_theme + scale_fill_manual(values = colors_fill)
+
+p_spec <- ggplot(results_df, aes(x = Method, y = Specificity, fill = Method)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Specificity (TNR)") + my_theme + scale_fill_manual(values = colors_fill)
+
+p_stab <- ggplot(stability_df, aes(x = Method, y = Stability, fill = Method)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Stability (Jaccard Index)") + my_theme + scale_fill_manual(values = colors_fill)
+
+# 组合绘图
+grid.arrange(p_mse, p_size, p_sens, p_spec, p_stab, 
+             ncol = 3, nrow = 2, 
+             top = "Mixed Data Experiment: Normal(10,1) & Binary(0/1)")
+
+# ==========================================
+# 6. 数值汇总
+# ==========================================
+final_summary <- merge(aggregate(cbind(MSE, Sensitivity, Specificity, SupportSize) ~ Method, results_df, mean),
+                       aggregate(Stability ~ Method, stability_df, mean), by="Method")
+cat("\n=== 异构数据实验结果汇总 ===\n")
+print(final_summary)
+```
+* 在这个情况下UniLasso表现非常好，模型稀疏，变量选择好，只牺牲了一些MSE，稳定性也大大提升了
+
+
+```{r}
+library(MASS)
+library(glmnet)
+library(ggplot2)
+library(gridExtra)
+library(pROC) # 用于计算 AUC
+
+# ==========================================
+# 1. 二元分类数据工厂 (Logistic Model)
+# ==========================================
+generate_binary_data <- function(n, p=1000, signal_strength=2.0) {
+  # 生成特征矩阵 X (独立正态分布)
+  X <- matrix(rnorm(n * p), n, p)
+  colnames(X) <- paste0("V", 1:p)
+  
+  # 真实系数: 只有前5个有效
+  beta_true <- rep(0, p)
+  beta_true[1:5] <- signal_strength 
+  
+  # 计算 Logit 概率: P(Y=1|X) = 1 / (1 + exp(-XB))
+  z <- X %*% beta_true
+  prob <- 1 / (1 + exp(-z))
+  
+  # 生成二元响应变量 Y (0 或 1)
+  Y <- rbinom(n, size = 1, prob = prob)
+  
+  return(list(X = X, Y = Y, beta_true = beta_true, true_support = 1:5))
+}
+
+# ==========================================
+# 2. 批量实验主循环
+# ==========================================
+B <- 50             # 重复次数
+n_train <- 100      # 极小样本
+n_test <- 500       # 测试集稍大以便准确评估 AUC
+p <- 1000           # 超高维
+
+results_df <- data.frame()
+
+cat("开始二元分类极端性能测试 (n=100, p=1000, True=5)...\n")
+pb <- txtProgressBar(min = 0, max = B, style = 3)
+
+set.seed(2025)
+
+for (b in 1:B) {
+  # 1. 生成数据
+  train <- generate_binary_data(n_train, p)
+  test <- generate_binary_data(n_test, p)
+  
+  # 2. UniLasso (Family = "binomial")
+  # 显式开启 standardize=TRUE 以防万一
+  # 注意：在二元分类中，UniLasso 第一阶段会使用 logistic 回归计算 score
+  fit_uni <- cv.uniLasso(train$X, train$Y, family = "binomial", standardize = TRUE)
+  
+  # 3. Standard Lasso (Family = "binomial")
+  fit_lasso <- cv.glmnet(train$X, train$Y, family = "binomial", standardize = TRUE)
+  
+  # --- 评估环节 ---
+  methods_list <- list("UniLasso" = fit_uni, "Lasso" = fit_lasso)
+  
+  for(m_name in names(methods_list)) {
+    fit <- methods_list[[m_name]]
+    
+    # A. 提取系数 (去截距)
+    coefs <- as.numeric(coef(fit, s = "lambda.min"))[-1]
+    n_selected <- sum(coefs != 0)
+    
+    # B. 计算 False Positives (噪音误选数)
+    # 真实只有前5个，索引 > 5 的都是误选
+    idx_selected <- which(coefs != 0)
+    fp_count <- sum(idx_selected > 5)
+    
+    # C. 计算 AUC (使用测试集)
+    # type="response" 返回概率值
+    pred_prob <- predict(fit, newx = test$X, s = "lambda.min", type = "response")
+    roc_obj <- roc(test$Y, as.vector(pred_prob), quiet = TRUE)
+    auc_val <- as.numeric(roc_obj$auc)
+    
+    # D. 计算 Misclassification Error (分类错误率)
+    pred_class <- ifelse(pred_prob > 0.5, 1, 0)
+    err_rate <- mean(pred_class != test$Y)
+    
+    # 记录
+    results_df <- rbind(results_df, data.frame(
+      Run = b,
+      Method = m_name,
+      AUC = auc_val,
+      ErrorRate = err_rate,
+      SupportSize = n_selected,
+      FalsePositives = fp_count
+    ))
+  }
+  setTxtProgressBar(pb, b)
+}
+close(pb)
+
+# ==========================================
+# 3. 可视化结果
+# ==========================================
+my_theme <- theme_minimal() + 
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face="bold"))
+colors_fill <- c("#56B4E9", "#E69F00")
+
+# 图1: AUC (越高越好)
+p_auc <- ggplot(results_df, aes(x=Method, y=AUC, fill=Method)) +
+  geom_boxplot(alpha=0.7) +
+  labs(title="Prediction Power: AUC", y="Area Under Curve (Max 1.0)") +
+  my_theme + scale_fill_manual(values=colors_fill)
+
+# 图2: 选中的变量总数 (越接近 5 越好)
+p_size <- ggplot(results_df, aes(x=Method, y=SupportSize, fill=Method)) +
+  geom_boxplot(alpha=0.7) +
+  geom_hline(yintercept = 5, linetype = "dashed", color = "red") +
+  labs(title="Model Sparsity: Total Selected", subtitle="True Signal = 5 (Red Line)", y="Count") +
+  my_theme + scale_fill_manual(values=colors_fill)
+
+# 图3: 假阳性数量 (噪音) - 核心指标
+p_fp <- ggplot(results_df, aes(x=Method, y=FalsePositives, fill=Method)) +
+  geom_boxplot(alpha=0.7) +
+  labs(title="Noise Filtering: False Positives", subtitle="How many junk variables were selected?", y="Count of Noise Features") +
+  my_theme + scale_fill_manual(values=colors_fill)
+
+# 图4: 错误率 (越低越好)
+p_err <- ggplot(results_df, aes(x=Method, y=ErrorRate, fill=Method)) +
+  geom_boxplot(alpha=0.7) +
+  labs(title="Classification Error Rate", y="Error Rate") +
+  my_theme + scale_fill_manual(values=colors_fill)
+
+grid.arrange(p_auc, p_err, p_size, p_fp, ncol=2, 
+             top="UniLasso Extreme Test: Binary Classification (p=1000, n=100)")
+
+# 数值汇总
+cat("\n====== 极端性能测试汇总 (Binary) ======\n")
+summary_stats <- aggregate(cbind(AUC, ErrorRate, SupportSize, FalsePositives) ~ Method, results_df, mean)
+print(summary_stats)
+```
+
+

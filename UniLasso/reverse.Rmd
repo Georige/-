@@ -1,0 +1,716 @@
+---
+title: "reverse"
+output: html_document
+---
+
+```{r}
+library(MASS)
+library(glmnet)
+library(ggplot2)
+library(gridExtra)
+library(reshape2)
+library(uniLasso)
+
+# 确保之前的辅助函数 (calc_metrics, calculate_pairwise_stability) 已经加载
+# 如果没有，请重新运行上一段代码中的 "辅助函数" 部分
+
+# ==========================================
+# 1. 实验 2 数据生成器
+# ==========================================
+
+generate_data_exp2 <- function(n, p = 10, linkage_coef = -0.5, sigma_noise = 1) {
+  # 1. 先生成基础数据，无相关性
+  # 均值为0，协方差为单位矩阵 (Identity Matrix)
+  X <- matrix(rnorm(n * p,10,1), nrow = n, ncol = p)
+  
+  # 2. 注入共线性构造 (The Knob)
+  # X2 = -0.5 * X1 + noise
+  # 注意：这里我们加上噪音，否则如果完全线性相关，矩阵不可逆
+  X[, 2] <- linkage_coef * X[, 1] + rnorm(n, 0, 1)
+  
+  # 3. 定义真实系数 Beta
+  # 设定前 3 个变量为有效变量，系数为 2
+  # 这样 X1 和 X2 既是相关变量，又是真实信号变量，测试难度很大
+  beta_true <- rep(0, p)
+  beta_true[1:2] <- 1 
+  true_support <- 1:2
+  
+  # 4. 生成响应变量 Y
+  epsilon <- rnorm(n, mean = 0, sd = sigma_noise)
+  Y <- X %*% beta_true + epsilon
+  
+  return(list(X = X, Y = Y, beta_true = beta_true, true_support = true_support))
+}
+
+# ==========================================
+# 2. 批量执行引擎
+# ==========================================
+
+B <- 50             # 重复次数
+n_train <- 100      # 训练样本
+n_test <- 1000      # 测试样本
+p_exp2 <- 10        # 特征数
+linkage_val <- -0.5 # 旋钮：负相关系数
+
+# 初始化容器
+results_exp2 <- data.frame() 
+sets_uni_exp2 <- list() 
+sets_lasso_exp2 <- list()
+
+cat("开始实验 2 (共线性测试, B =", B, "次)...\n")
+pb <- txtProgressBar(min = 0, max = B, style = 3)
+
+set.seed(2025) # 保证可复现
+
+for (b in 1:B) {
+  # 1. 数据生成
+  train <- generate_data_exp2(n_train, p = p_exp2, linkage_coef = linkage_val)
+  test <- generate_data_exp2(n_test, p = p_exp2, linkage_coef = linkage_val)
+  
+  # 2. UniLasso
+  # 注意：p=9 时，默认 cross-validation 可能警告 fold 数量问题，但在 n=100 下通常没问题
+  fit_uni <- cv.uniLasso(train$X, train$Y, family = "gaussian")
+  coef_uni <- as.numeric(coef(fit_uni, s = "lambda.min"))
+  names(coef_uni) <- rownames(coef(fit_uni))
+  pred_uni <- predict(fit_uni, newx = test$X, s = "lambda.min")
+  
+  m_uni <- calc_metrics(coef_uni, train$true_support, p_exp2, test$Y, pred_uni)
+  sets_uni_exp2[[b]] <- m_uni$SupportSet
+  
+  # 3. Lasso
+  fit_lasso <- cv.glmnet(train$X, train$Y, family = "gaussian")
+  coef_lasso <- as.numeric(coef(fit_lasso, s = "lambda.min"))
+  names(coef_lasso) <- rownames(coef(fit_lasso))
+  pred_lasso <- predict(fit_lasso, newx = test$X, s = "lambda.min")
+  
+  m_lasso <- calc_metrics(coef_lasso, train$true_support, p_exp2, test$Y, pred_lasso)
+  sets_lasso_exp2[[b]] <- m_lasso$SupportSet
+  
+  # 4. 记录标量结果
+  tmp_df <- data.frame(
+    Run = b,
+    Method = c("UniLasso", "Lasso"),
+    MSE = c(m_uni$MSE, m_lasso$MSE),
+    Sensitivity = c(m_uni$Sensitivity, m_lasso$Sensitivity),
+    Specificity = c(m_uni$Specificity, m_lasso$Specificity),
+    SupportSize = c(m_uni$SupportSize, m_lasso$SupportSize)
+  )
+  results_exp2 <- rbind(results_exp2, tmp_df)
+  
+  setTxtProgressBar(pb, b)
+}
+close(pb)
+
+# ==========================================
+# 3. 计算稳定性
+# ==========================================
+
+cat("\n计算稳定性指标...\n")
+stab_uni_exp2 <- calculate_pairwise_stability(sets_uni_exp2)
+stab_lasso_exp2 <- calculate_pairwise_stability(sets_lasso_exp2)
+
+stability_df_exp2 <- data.frame(
+  Stability = c(stab_uni_exp2, stab_lasso_exp2),
+  Method = rep(c("UniLasso", "Lasso"), each = length(stab_uni_exp2))
+)
+
+# ==========================================
+# 4. 可视化模块
+# ==========================================
+
+# 颜色主题：使用稍微不同的配色以区分这是实验2
+my_theme <- theme_minimal() + 
+  theme(legend.position = "none", 
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank())
+fill_colors <- c("#D55E00", "#009E73") # 红/绿配色
+
+# MSE
+p2_mse <- ggplot(results_exp2, aes(x = Method, y = MSE, fill = Method)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Test MSE", y = "MSE") +
+  my_theme + scale_fill_manual(values = fill_colors)
+
+# Support Size
+p2_size <- ggplot(results_exp2, aes(x = Method, y = SupportSize, fill = Method)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_hline(yintercept = 3, linetype = "dashed", color = "black") + # 真实非零个数为3
+  labs(title = "Support Set Size", y = "Count (True=3)") +
+  my_theme + scale_fill_manual(values = fill_colors)
+
+# Sensitivity
+p2_sens <- ggplot(results_exp2, aes(x = Method, y = Sensitivity, fill = Method)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Sensitivity", y = "Rate") +
+  my_theme + scale_fill_manual(values = fill_colors)
+
+# Specificity
+p2_spec <- ggplot(results_exp2, aes(x = Method, y = Specificity, fill = Method)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Specificity", y = "Rate") +
+  my_theme + scale_fill_manual(values = fill_colors)
+
+# Stability
+p2_stab <- ggplot(stability_df_exp2, aes(x = Method, y = Stability, fill = Method)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Stability (Jaccard)", y = "Score") +
+  my_theme + scale_fill_manual(values = fill_colors)
+
+# 组合图表
+grid.arrange(p2_mse, p2_size, p2_sens, p2_spec, p2_stab,
+             ncol = 3, nrow = 2,
+             top = paste0("Experiment 2: Small p, Correlated X1, X2 (coef=", linkage_val, ")"))
+
+# ==========================================
+# 5. 结果统计表
+# ==========================================
+
+summary_stats_2 <- aggregate(cbind(MSE, Sensitivity, Specificity, SupportSize) ~ Method, 
+                           data = results_exp2, mean)
+summary_stab_2 <- aggregate(Stability ~ Method, data = stability_df_exp2, mean)
+
+final_summary_2 <- merge(summary_stats_2, summary_stab_2, by = "Method")
+cat("\n=== 实验 2 指标均值汇总 ===\n")
+print(final_summary_2)
+
+# ==========================================
+# 额外分析：检查 X1 和 X2 的同时选中率
+# ==========================================
+# 在这个实验中，最有趣的是看 X1 和 X2 是否同时被选中
+check_co_selection <- function(sets) {
+  count <- 0
+  for(s in sets) {
+    if (all(c(1, 2) %in% s)) count <- count + 1
+  }
+  return(count / length(sets))
+}
+
+co_uni <- check_co_selection(sets_uni_exp2)
+co_lasso <- check_co_selection(sets_lasso_exp2)
+
+cat("\nX1 和 X2 同时被选中的概率:\n")
+cat("UniLasso:", co_uni * 100, "%\n")
+cat("Lasso:   ", co_lasso * 100, "%\n")
+```
+
+```{r}
+library(MASS)
+library(glmnet)
+library(ggplot2)
+library(reshape2)
+library(gridExtra)
+
+# ==========================================
+# 1. 修正后的数据工厂 (p=200)
+# ==========================================
+generate_counter_example_large <- function(n, p = 200, sigma_noise = 1) {
+  # 1. 生成基础噪音数据 (标准正态)
+  X <- matrix(rnorm(n * p,10,1), n, p)
+  colnames(X) <- paste0("V", 1:p)
+  
+  # 2. 构造陷阱：X2 与 X1 负相关
+  # X2 = -0.5 * X1 + noise
+  # 注意：为了让相关性足够强以误导一元回归，我们需要控制 X2 的噪音比例
+  # 这里的构造方式保证 V2 本身的方差不会过大
+  X[, 2] <- -0.5 * X[, 1] + rnorm(n, 0, 0.5) 
+  
+  # 3. 构造响应变量 Y
+  # 真实系数: V1=1, V2=1 (两者都是正的), 其余为0
+  beta_true <- rep(0, p)
+  beta_true[1:2] <- 1 
+  
+  epsilon <- rnorm(n, mean = 0, sd = sigma_noise)
+  Y <- X %*% beta_true + epsilon
+  
+  return(list(X = X, Y = Y, beta_true = beta_true))
+}
+
+# ==========================================
+# 2. 批量实验 (50次)
+# ==========================================
+B <- 50
+n_train <- 100
+p <- 200  # 高维设置
+
+# 初始化累加器 (只关注前10个变量，减少内存和计算负担，因为后面都是噪音)
+top_k <- 10 
+sum_coef_uni <- numeric(top_k)
+sum_coef_lasso <- numeric(top_k)
+sum_coef_info <- numeric(top_k)
+
+cat("开始执行 50 次实验 (n=100, p=200)...\n")
+pb <- txtProgressBar(min = 0, max = B, style = 3)
+
+set.seed(2025)
+
+for (b in 1:B) {
+  # 生成数据
+  d <- generate_counter_example_large(n_train, p)
+  
+  # 1. UniLasso
+  # family="gaussian"
+  fit_uni <- cv.uniLasso(d$X, d$Y, family = "gaussian")
+  
+  # 提取系数 (去掉 Intercept)
+  # 注意：coef 返回的是稀疏矩阵，需要转为 numeric
+  full_coef_uni <- as.numeric(coef(fit_uni, s = "lambda.min"))[-1]
+  
+  # 2. Lasso
+  fit_lasso <- cv.glmnet(d$X, d$Y, family = "gaussian")
+  full_coef_lasso <- as.numeric(coef(fit_lasso, s = "lambda.min"))[-1]
+  
+  # 3. 提取 Univariate Info (第一阶段系数)
+  full_coef_info <- fit_uni$info$beta
+  
+  # 累加前10个变量
+  sum_coef_uni <- sum_coef_uni + full_coef_uni[1:top_k]
+  sum_coef_lasso <- sum_coef_lasso + full_coef_lasso[1:top_k]
+  sum_coef_info <- sum_coef_info + full_coef_info[1:top_k]
+  
+  setTxtProgressBar(pb, b)
+}
+close(pb)
+
+# ==========================================
+# 3. 结果汇总与对比表格
+# ==========================================
+
+# 计算平均值
+avg_results <- data.frame(
+  Variable = paste0("V", 1:top_k),
+  True_Beta = c(1, 1, rep(0, top_k - 2)), # V1, V2是1，其他是0
+  Avg_Info_Univariate = round(sum_coef_info / B, 3),
+  Avg_UniLasso = round(sum_coef_uni / B, 3),
+  Avg_Standard_Lasso = round(sum_coef_lasso / B, 3)
+)
+
+cat("\n\n====== 系数对比表 (前10个变量, 50次平均) ======\n")
+print(avg_results)
+
+# ==========================================
+# 4. 可视化
+# ==========================================
+
+# 变形为长格式用于 ggplot
+df_melt <- melt(avg_results, id.vars = c("Variable", "True_Beta"))
+
+# 绘制柱状图
+p_coef <- ggplot(df_melt, aes(x = Variable, y = value, fill = variable)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  # 添加真实值作为参考点 (红钻)
+  geom_point(aes(y = True_Beta), shape = 18, size = 3, color = "red", 
+             position = position_dodge(width = 0.8), show.legend = FALSE) +
+  geom_hline(yintercept = 0, color = "black", alpha = 0.5) +
+  scale_fill_manual(values = c("#999999", "#E69F00", "#56B4E9"), 
+                    labels = c("Univariate Info", "UniLasso", "Standard Lasso")) +
+  labs(title = "UniLasso Failure Analysis: Coefficient Comparison",
+       subtitle = "Red Diamond = True Value. Note V2 behavior.",
+       y = "Average Coefficient Value",
+       fill = "Method") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+print(p_coef)
+
+# ==========================================
+# 5. 架构师分析报告
+# ==========================================
+cat("\n====== 架构师分析报告 ======\n")
+cat("关注变量 V2 的表现:\n")
+v2_row <- avg_results[avg_results$Variable == "V2", ]
+cat("真实系数 (True): ", v2_row$True_Beta, "\n")
+cat("一元回归 (Info): ", v2_row$Avg_Info_Univariate, " (注意符号!)\n")
+cat("UniLasso 结果:   ", v2_row$Avg_UniLasso, "\n")
+cat("Lasso 结果:      ", v2_row$Avg_Standard_Lasso, "\n")
+
+if(v2_row$Avg_UniLasso < 0.1) {
+  cat("\n[结论]: UniLasso 在 V2 上彻底失效。原因是 'Info' 错误地指示了负方向，\n")
+  cat("导致 UniLasso 强行将正系数压缩至 0 (或非常小)。\n")
+} else {
+  cat("\n[结论]: UniLasso 仍然保留了部分系数，说明信号极强，但在这种设置下通常会显著小于 Lasso。\n")
+}
+```
+
+# 反例UniLasso和Lasso实验
+
+```{r}
+library(MASS)
+library(glmnet)
+library(ggplot2)
+library(gridExtra)
+library(reshape2)
+library(grid)
+
+# ==========================================
+# 1. 数据工厂 (p=200, 反例结构)
+# ==========================================
+generate_counter_example_large <- function(n, p = 200, sigma_noise = 1) {
+  X <- matrix(rnorm(n * p,10,1), n, p)
+  colnames(X) <- paste0("V", 1:p)
+  
+  # 构造陷阱：X2 与 X1 负相关 (-0.5)
+  # 控制噪音以保证一元误导性足够强
+  X[, 2] <- -0.5 * X[, 1] + rnorm(n, 0, 0.5) 
+  
+  # 真实系数: V1=1, V2=1
+  beta_true <- rep(0, p)
+  beta_true[1:2] <- 1 
+  true_support <- 1:2
+  
+  epsilon <- rnorm(n, mean = 0, sd = sigma_noise)
+  Y <- X %*% beta_true + epsilon
+  
+  return(list(X = X, Y = Y, beta_true = beta_true, true_support = true_support))
+}
+
+# ==========================================
+# 2. 指标计算器 (辅助函数)
+# ==========================================
+calc_metrics <- function(coef_vec, true_support, p, y_true, y_pred) {
+  if(names(coef_vec)[1] == "(Intercept)") coef_vec <- coef_vec[-1]
+  active_idx <- which(coef_vec != 0)
+  
+  support_size <- length(active_idx)
+  tp <- length(intersect(active_idx, true_support))
+  sens <- tp / length(true_support) # TPR
+  
+  true_zeros <- setdiff(1:p, true_support)
+  pred_zeros <- setdiff(1:p, active_idx)
+  tn <- length(intersect(pred_zeros, true_zeros))
+  spec <- tn / length(true_zeros) # TNR
+  
+  mse <- mean((y_true - y_pred)^2)
+  
+  return(list(MSE = mse, Sensitivity = sens, Specificity = spec, 
+              SupportSize = support_size, SupportSet = active_idx))
+}
+
+# 稳定性计算函数
+calculate_pairwise_stability <- function(support_list) {
+  n_runs <- length(support_list)
+  pairs <- combn(n_runs, 2)
+  stability_scores <- apply(pairs, 2, function(idx) {
+    s1 <- support_list[[idx[1]]]
+    s2 <- support_list[[idx[2]]]
+    u <- length(union(s1, s2))
+    if(u == 0) 0 else length(intersect(s1, s2)) / u
+  })
+  return(stability_scores)
+}
+
+# ==========================================
+# 3. 批量实验主循环
+# ==========================================
+B <- 200
+n_train <- 200
+n_test <- 1000
+p <- 20
+top_k <- 10 
+
+# 存储容器
+results_df <- data.frame()
+support_sets_uni <- list()
+support_sets_lasso <- list()
+
+# 系数累加器 (用于平均系数图)
+sum_coef_uni <- numeric(top_k)
+sum_coef_lasso <- numeric(top_k)
+sum_coef_info <- numeric(top_k)
+
+cat("开始终极实验 (n=100, p=200, B=50)...\n")
+pb <- txtProgressBar(min = 0, max = B, style = 3)
+
+set.seed(2025)
+
+for (b in 1:B) {
+  # 生成数据
+  train <- generate_counter_example_large(n_train, p)
+  test <- generate_counter_example_large(n_test, p)
+  
+  # --- 1. UniLasso ---
+  fit_uni <- cv.uniLasso(train$X, train$Y, family = "gaussian")
+  coef_uni <- as.numeric(coef(fit_uni, s = "lambda.min"))
+  names(coef_uni) <- rownames(coef(fit_uni))
+  pred_uni <- predict(fit_uni, newx = test$X, s = "lambda.min")
+  
+  # 记录指标
+  m_uni <- calc_metrics(coef_uni, train$true_support, p, test$Y, pred_uni)
+  support_sets_uni[[b]] <- m_uni$SupportSet
+  
+  # 记录系数 (去截距, 前10个)
+  coef_uni_clean <- coef_uni[-1]
+  sum_coef_uni <- sum_coef_uni + coef_uni_clean[1:top_k]
+  sum_coef_info <- sum_coef_info + fit_uni$info$beta[1:top_k]
+  
+  # --- 2. Standard Lasso ---
+  fit_lasso <- cv.glmnet(train$X, train$Y, family = "gaussian")
+  coef_lasso <- as.numeric(coef(fit_lasso, s = "lambda.min"))
+  names(coef_lasso) <- rownames(coef(fit_lasso))
+  pred_lasso <- predict(fit_lasso, newx = test$X, s = "lambda.min")
+  
+  # 记录指标
+  m_lasso <- calc_metrics(coef_lasso, train$true_support, p, test$Y, pred_lasso)
+  support_sets_lasso[[b]] <- m_lasso$SupportSet
+  
+  # 记录系数 (去截距, 前10个)
+  coef_lasso_clean <- coef_lasso[-1]
+  sum_coef_lasso <- sum_coef_lasso + coef_lasso_clean[1:top_k]
+  
+  # --- 3. 汇总 Loop Data ---
+  tmp_df <- data.frame(
+    Run = b,
+    Method = c("UniLasso", "Lasso"),
+    MSE = c(m_uni$MSE, m_lasso$MSE),
+    Sensitivity = c(m_uni$Sensitivity, m_lasso$Sensitivity),
+    Specificity = c(m_uni$Specificity, m_lasso$Specificity),
+    SupportSize = c(m_uni$SupportSize, m_lasso$SupportSize)
+  )
+  results_df <- rbind(results_df, tmp_df)
+  
+  setTxtProgressBar(pb, b)
+}
+close(pb)
+
+# ==========================================
+# 4. 后处理: 计算稳定性
+# ==========================================
+stab_uni <- calculate_pairwise_stability(support_sets_uni)
+stab_lasso <- calculate_pairwise_stability(support_sets_lasso)
+stability_df <- data.frame(
+  Stability = c(stab_uni, stab_lasso),
+  Method = rep(c("UniLasso", "Lasso"), each = length(stab_uni))
+)
+
+# ==========================================
+# 5. 可视化部分 A: 平均系数柱状图
+# ==========================================
+avg_coef_data <- data.frame(
+  Variable = factor(paste0("V", 1:top_k), levels = paste0("V", 1:top_k)),
+  True_Beta = c(1, 1, rep(0, top_k - 2)),
+  Avg_Info = sum_coef_info / B,
+  Avg_UniLasso = sum_coef_uni / B,
+  Avg_Lasso = sum_coef_lasso / B
+)
+
+df_melt_coef <- melt(avg_coef_data, id.vars = c("Variable", "True_Beta"))
+
+p_coef <- ggplot(df_melt_coef, aes(x = Variable, y = value, fill = variable)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  geom_point(aes(y = True_Beta), shape = 18, size = 3, color = "red", 
+             position = position_dodge(width = 0.8), show.legend = FALSE) +
+  geom_hline(yintercept = 0, color = "black", alpha = 0.3) +
+  scale_fill_manual(values = c("#999999", "#E69F00", "#56B4E9"), 
+                    labels = c("Info (Univariate)", "UniLasso", "Lasso")) +
+  labs(title = "Average Coefficients (First 10 Variables)",
+       y = "Coefficient Value", fill = "Method") +
+  theme_minimal() + theme(legend.position = "top")
+
+# ==========================================
+# 6. 可视化部分 B: 性能指标箱线图
+# ==========================================
+my_theme <- theme_minimal() + 
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face="bold", size=10))
+colors_fill <- c("#56B4E9","#E69F00")
+
+p_mse <- ggplot(results_df, aes(x=Method, y=MSE, fill=Method)) + geom_boxplot(alpha=0.7) + 
+  labs(title="Test MSE (Lower is Better)") + my_theme + scale_fill_manual(values=colors_fill)
+
+p_sens <- ggplot(results_df, aes(x=Method, y=Sensitivity, fill=Method)) + geom_boxplot(alpha=0.7) + 
+  labs(title="Sensitivity (TPR)") + my_theme + scale_fill_manual(values=colors_fill)
+
+p_spec <- ggplot(results_df, aes(x=Method, y=Specificity, fill=Method)) + geom_boxplot(alpha=0.7) + 
+  labs(title="Specificity (TNR)") + my_theme + scale_fill_manual(values=colors_fill)
+
+p_stab <- ggplot(stability_df, aes(x=Method, y=Stability, fill=Method)) + geom_boxplot(alpha=0.7) + 
+  labs(title="Stability (Jaccard Index)") + my_theme + scale_fill_manual(values=colors_fill)
+
+# ==========================================
+# 7. 最终组合输出
+# ==========================================
+# 使用 grid.arrange 构建复杂的布局
+# 上半部分放系数图 (占大空间)，下半部分放四个箱线图
+
+# 创建下半部分的 grid
+bottom_grid <- arrangeGrob(p_mse, p_sens, p_spec, p_stab, ncol = 4)
+
+grid.arrange(p_coef, bottom_grid, nrow = 2, heights = c(1.2, 1),
+             top = textGrob("UniLasso vs Lasso: The 'Counter-Example' Breakdown", 
+                            gp = gpar(fontsize = 15, fontface = "bold")))
+
+# 打印数值汇总
+final_summary <- merge(aggregate(cbind(MSE, Sensitivity, Specificity, SupportSize) ~ Method, results_df, mean),
+                       aggregate(Stability ~ Method, stability_df, mean), by="Method")
+cat("\n=== 实验指标均值汇总 ===\n")
+print(final_summary)
+```
+
+
+
+
+* p = 20,n = 100时（信息充足的情况下）Lasso的表现会比UniLasso表现好很多，sensitivity很高，随着数据量越来越大，Lasso的表现越来越好，Lasso变得越来越稳定，不过排除错误选项的能力比不上UniLasso
+* p = 200, n =100时（信息不足的情况下）两者并没有相差太多，都表现很差，系数恢复得很差，综合来看UniLasso表现更好啊，稳定性好，误差也小，Lasso有随机上限，但是UniLasso有稳定下限
+，随着样本越来越少，表现越来越差，确实那个模型可以在信息小的时候也能很好呢
+
+
+# UniLasso崩溃实验
+```{r}
+library(MASS)
+library(glmnet)
+library(ggplot2)
+library(gridExtra)
+library(dplyr)
+
+# ==========================================
+# 1. 动态数据生成器 (带 Rho 旋钮)
+# ==========================================
+generate_knob_data <- function(n, p, rho, sigma_noise = 1) {
+  X <- matrix(rnorm(n * p,10,1), n, p)
+  colnames(X) <- paste0("V", 1:p)
+  
+  # 关键逻辑：X2 = rho * X1 + noise
+  # 我们保持 noise 的方差相对恒定，以便清晰地观察 rho 的影响
+  # 这里 noise 的 sd 设为 0.5，既保证相关性，又保留 X2 自身的变异
+  X[, 2] <- rho * X[, 1] + rnorm(n, 0, 0.5)
+  
+  # 真实关系 Y = X1 + X2 (系数均为 1)
+  beta_true <- rep(0, p)
+  beta_true[1:2] <- 1
+  
+  Y <- X %*% beta_true + rnorm(n, 0, sigma_noise)
+  
+  return(list(X = X, Y = Y))
+}
+
+# ==========================================
+# 2. 旋钮调节实验主循环
+# ==========================================
+
+# 设置参数
+n <- 100
+p <- 20
+B <- 50 # 每个 rho 值重复 50 次取平均
+
+# 定义旋钮范围：从 0 到 -1，步长 0.05
+rho_values <- seq(0, -1, by = -0.05)
+
+# 存储结果
+results_list <- list()
+
+cat("开始执行旋钮调节实验 (Rho: 0 -> -1)...\n")
+pb <- txtProgressBar(min = 0, max = length(rho_values), style = 3)
+
+for (i in seq_along(rho_values)) {
+  r <- rho_values[i]
+  
+  # 临时存储每次重复的 V2 系数
+  v2_uni_coefs <- numeric(B)
+  v2_info_coefs <- numeric(B)
+  test_mses <- numeric(B)
+  
+  for (b in 1:B) {
+    # 生成数据
+    train <- generate_knob_data(n, p, rho = r)
+    test <- generate_knob_data(1000, p, rho = r) # 大测试集测 MSE
+    
+    # 训练 UniLasso
+    fit <- cv.uniLasso(train$X, train$Y, family = "gaussian")
+    
+    # 提取 V2 的最终系数
+    coef_final <- as.numeric(coef(fit, s = "lambda.min"))
+    names(coef_final) <- rownames(coef(fit))
+    v2_uni_coefs[b] <- coef_final["V2"]
+    
+    # 提取 V2 的一元 Info 系数
+    # 注意：uniInfo 的 beta 不包含截距，索引 2 就是 V2
+    v2_info_coefs[b] <- fit$info$beta[2]
+    
+    # 计算 MSE
+    pred <- predict(fit, newx = test$X, s = "lambda.min")
+    test_mses[b] <- mean((test$Y - pred)^2)
+  }
+  
+  # 汇总当前 rho 的结果
+  results_list[[i]] <- data.frame(
+    Rho = r,
+    Avg_UniLasso_Coef_V2 = mean(v2_uni_coefs),
+    Avg_Info_Coef_V2 = mean(v2_info_coefs),
+    Avg_MSE = mean(test_mses)
+  )
+  
+  setTxtProgressBar(pb, i)
+}
+close(pb)
+
+# 合并结果
+df_results <- do.call(rbind, results_list)
+
+# ==========================================
+# 3. 可视化分析
+# ==========================================
+
+# 图 1: 系数随 Rho 的变化趋势 (核心图)
+p_coef <- ggplot(df_results, aes(x = Rho)) +
+  # 添加参考线：真实系数 = 1
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red", alpha = 0.5) +
+  annotate("text", x = -0.1, y = 1.1, label = "True Beta (1.0)", color = "red", size = 3) +
+  
+  # 添加参考线：0 (UniLasso 被压缩的死线)
+  geom_hline(yintercept = 0, color = "black", alpha = 0.3) +
+  
+  # 绘制一元 Info 系数 (灰色虚线)
+  geom_line(aes(y = Avg_Info_Coef_V2, color = "Univariate Info"), size = 1, linetype = "longdash") +
+  geom_point(aes(y = Avg_Info_Coef_V2, color = "Univariate Info"), size = 2) +
+  
+  # 绘制 UniLasso 最终系数 (橙色实线)
+  geom_line(aes(y = Avg_UniLasso_Coef_V2, color = "UniLasso Final"), size = 1.2) +
+  geom_point(aes(y = Avg_UniLasso_Coef_V2, color = "UniLasso Final"), size = 3) +
+  
+  scale_color_manual(values = c("Univariate Info" = "gray50", "UniLasso Final" = "#E69F00")) +
+  
+  labs(title = "The Breakdown of V2: Coefficient Trajectory",
+       subtitle = "As correlation (Rho) becomes more negative, when does UniLasso fail?",
+       x = "Correlation Rho (X2 = Rho * X1)",
+       y = "Coefficient Value of V2",
+       color = "Metric") +
+  theme_minimal() +
+  theme(legend.position = "bottom", plot.title = element_text(face="bold"))
+
+# 图 2: 模型 MSE 随 Rho 的变化
+p_mse <- ggplot(df_results, aes(x = Rho, y = Avg_MSE)) +
+  geom_line(color = "darkred", size = 1) +
+  geom_point(color = "darkred", size = 2) +
+  labs(title = "Model Performance Degradation",
+       y = "Test Mean Squared Error (MSE)",
+       x = "Correlation Rho") +
+  theme_minimal()
+
+# 组合展示
+grid.arrange(p_coef, p_mse, nrow = 2, heights = c(2, 1))
+
+# ==========================================
+# 4. 寻找具体的“崩溃点”
+# ==========================================
+# 找出 Info 系数第一次变为负数的 Rho
+breakdown_point_info <- df_results %>% 
+  filter(Avg_Info_Coef_V2 < 0) %>% 
+  head(1)
+
+# 找出 UniLasso 系数第一次跌破 0.1 (视为失效) 的 Rho
+breakdown_point_model <- df_results %>% 
+  filter(Avg_UniLasso_Coef_V2 < 0.1) %>% 
+  head(1)
+
+cat("\n====== 敏感度分析报告 ======\n")
+if(nrow(breakdown_point_info) > 0) {
+  cat("1. 诱因出现 (Info转负): 在 Rho =", breakdown_point_info$Rho, 
+      "时，一元回归系数均值首次变为负数 (", round(breakdown_point_info$Avg_Info_Coef_V2, 3), ")。\n")
+}
+if(nrow(breakdown_point_model) > 0) {
+  cat("2. 模型崩溃 (UniLasso失效): 在 Rho =", breakdown_point_model$Rho, 
+      "时，UniLasso 对 V2 的系数均值跌至", round(breakdown_point_model$Avg_UniLasso_Coef_V2, 3), 
+      "(< 0.1)，基本丢失该变量。\n")
+}
+
+print(head(df_results, 15)) # 打印前15行数据查看细节
+```
+* 可以看到系数从-0.5~-1的时候模型系数以及单变量系数会被压缩到0附近，而且在这个区间模型的表现非常差

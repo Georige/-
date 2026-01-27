@@ -1,0 +1,858 @@
+---
+title: "Neutral"
+output: html_document
+---
+
+```{r}
+# 安装并加载包
+if(!require(neuralnet)) install.packages("neuralnet")
+library(neuralnet)
+
+# 使用内置的 iris 数据集（为了简化，只取两类和两个变量）
+data <- iris[1:100, c(1, 2, 5)]
+data$Species <- as.numeric(data$Species) - 1 # 转换为 0 和 1
+
+# 拟合神经网络 (2个输入 -> 3个神经元的隐层 -> 1个输出)
+nn <- neuralnet(Species ~ Sepal.Length + Sepal.Width, 
+                data = data, 
+                hidden = 3, 
+                linear.output = FALSE)
+
+# 画出网络图
+plot(nn)
+```
+
+```{r}
+# 1. 加载必要的库
+# 如果没有安装，请运行: install.packages(c("neuralnet", "ggplot2", "reshape2"))
+library(neuralnet)
+library(ggplot2)
+
+# 2. 设置随机种子，保证每次运行结果一致 (Reproductibility)
+set.seed(123)
+
+# 3. 定义常量
+n_samples <- 200    # 样本数量
+n_vars <- 100       # 变量总数 (特征数)
+n_effective <- 20   # 有效变量数 (真正有权重的)
+
+# 4. 生成输入矩阵 X (200行, 100列)，服从标准正态分布
+# rnorm: 生成正态分布随机数
+# matrix: 将向量转化为矩阵
+X <- matrix(rnorm(n_samples * n_vars), nrow = n_samples, ncol = n_vars)
+
+# 给列命名: Var1, Var2, ..., Var100
+colnames(X) <- paste0("Var", 1:n_vars)
+
+# 5. 生成权重向量 (True Weights)
+# 前20个变量给随机权重，后80个变量权重为0
+true_weights <- c(runif(n_effective, min = 1.9, max = 2.1), rep(0, n_vars - n_effective))
+
+# 6. 生成目标变量 Y
+# %*% 是 R 语言中的矩阵乘法符号
+# 加上 rnorm(n_samples) 是为了添加一点随机噪声，模拟真实世界的不完美数据
+y <- X %*% true_weights + rnorm(n_samples)
+
+# 将数据整合为一个 Data Frame (neuralnet 需要这种格式)
+data <- as.data.frame(cbind(X, Target = y))
+colnames(data)[ncol(data)] <- "Target"
+# 检查数据维度
+print(dim(data)) 
+# 预期输出: [1] 200 101  (100个特征 + 1个目标变量)
+```
+
+```{r}
+# 定义最大最小归一化函数
+normalize <- function(x) {
+  return ((x - min(x)) / (max(x) - min(x)))
+}
+
+# 对整个数据集应用归一化
+# as.data.frame: 确保结果还是数据框
+# lapply: 对列表/数据框的每一列应用函数
+data_norm <- as.data.frame(lapply(data, normalize))
+
+# 简单查看前几行，确保都在 0-1 之间
+head(data_norm[, 1:5])
+```
+
+
+```{r}
+# 1. 动态构建公式字符串
+# paste(..., collapse = "+") 会把所有变量名用 "+" 连接起来
+var_names <- colnames(X)
+formula_str <- paste("Target ~", paste(var_names, collapse = " + "))
+formula_obj <- as.formula(formula_str)
+
+print(formula_str) 
+# 你会看到类似: "Target ~ Var1 + Var2 + ... + Var100"
+
+# 2. 训练模型
+# linear.output = TRUE: 因为我们做的是回归任务（预测数值），不是分类
+# hidden = c(5, 3): 定义隐藏层结构。这里我设计了两层，第一层5个神经元，第二层3个。
+# threshold: 训练停止的误差阈值
+print("开始训练神经网络，请稍候...")
+nn_model <- neuralnet(formula_obj, 
+                      data = data_norm, 
+                      hidden = c(5),   # 使用单隐层，5个节点，避免过于复杂导致过拟合
+                      linear.output = TRUE,
+                      stepmax = 1e6)   # 增加最大迭代步数
+
+print("训练完成！")
+```
+
+
+```{r}
+# --- 可视化 1: 神经网络拓扑结构 ---
+# 这是一个基础绘图，可能需要放大查看
+plot(nn_model, rep = "best", show.weights = FALSE) 
+# show.weights = FALSE 可以让图清爽一点，否则线条上全是数字
+
+# --- 可视化 2: 预测能力评估 (ggplot2) ---
+
+# 1. 计算预测结果
+# compute() 函数返回神经网络对输入数据的输出
+predict_results <- compute(nn_model, data_norm[, 1:100])
+
+# 2. 获取预测值 (net.result) 并反归一化 (可选，这里为了简单直接比较归一化后的值)
+pred_values <- predict_results$net.result
+
+# 3. 构建绘图数据框
+results_df <- data.frame(
+  Actual = data_norm$Target,
+  Predicted = pred_values
+)
+
+# 4. 使用 ggplot2 绘制 实际值 vs 预测值
+ggplot(results_df, aes(x = Actual, y = Predicted)) +
+  geom_point(color = "blue", alpha = 0.6) +      # 散点
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", size = 1) + # 完美预测线
+  labs(title = "神经网络训练效果: 实际值 vs 预测值",
+       subtitle = paste("输入变量: 100个 (20个有效, 80个噪声)"),
+       x = "归一化后的真实值 (Target)",
+       y = "神经网络预测值 (Predicted)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# 5. 计算相关系数 (Correlation) 看拟合程度
+correlation <- cor(results_df$Actual, results_df$Predicted)
+print(paste("预测值与真实值的相关系数:", round(correlation, 4)))
+```
+
+
+```{r}
+library(ggplot2)
+library(reshape2)
+
+# ==========================================
+# 步骤 1: 提取“黑盒”里的权重
+# ==========================================
+
+# nn_model$weights[[1]] 是一个列表，包含各层之间的权重
+# 第一个元素 [[1]] 是 输入层 -> 隐含层 的矩阵
+# 矩阵维度应该是: (101行) x (5列)。注意：多出来的1行是截距(Bias/Intercept)
+weight_matrix <- nn_model$weights[[1]][[1]]
+
+# 给矩阵加上名字，方便我们辨认
+# 排除掉截距项(通常是第一行)，我们只关心 Var1...Var100
+# 注意：neuralnet 内部存储顺序可能包含 Intercept 在第一位
+row_names <- c("Intercept", colnames(data)[1:100]) # 构造行名
+rownames(weight_matrix) <- row_names
+colnames(weight_matrix) <- paste0("Hidden_", 1:5)  # 构造列名 (5个隐藏神经元)
+
+# 去掉第一行(Intercept)，因为我们只想看100个变量的权重
+input_weights <- weight_matrix[-1, ] 
+
+# ==========================================
+# 步骤 2: 计算每个变量的“总影响力”
+# ==========================================
+# 逻辑：一个变量连接到5个隐藏神经元，有5个权重。
+# 如果这5个权重的绝对值加起来很大，说明这个变量很重要。
+# rowSums(abs(...)): 计算每一行的绝对值之和
+variable_importance <- rowSums(abs(input_weights))
+
+# 转成数据框方便绘图
+importance_df <- data.frame(
+  Variable = names(variable_importance),
+  Importance = variable_importance
+)
+
+# ==========================================
+# 步骤 3: 筛选并可视化 (只看 Top 30)
+# ==========================================
+
+# 按重要性降序排列
+importance_df <- importance_df[order(-importance_df$Importance), ]
+
+# 取前 30 个最强的变量
+top_vars <- head(importance_df, 30)
+
+# 打印出来看看，前20个是不是我们设定的有效变量？
+print("影响力最大的前10个变量:")
+print(head(top_vars, 10))
+
+# 画图
+ggplot(top_vars, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() + # 翻转坐标轴，变成横向条形图，方便看名字
+  labs(title = "神经网络捕捉到的关键变量 (Top 30)",
+       subtitle = "基于输入层到隐藏层的权重绝对值总和",
+       x = "变量名称",
+       y = "权重总强度 (Importance)") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 8)) # 调整字体大小防止重叠
+```
+
+
+```{r}
+# --- 准备工作：提取局部权重 ---
+
+# 1. 提取 输入层 -> 隐藏层 的权重
+# 原始矩阵包含截距(Intercept)，所以行索引是从 2 开始到 6 (对应 Var1 到 Var5)
+# 这里的索引 2:6 对应的是 Var1, Var2, Var3, Var4, Var5
+w_in_hidden <- nn_model$weights[[1]][[1]][2:6, ] 
+
+# 2. 提取 隐藏层 -> 输出层 的权重
+# 同样去掉第一个截距项
+w_hidden_out <- nn_model$weights[[1]][[2]][-1, ]
+
+# --- 绘图参数设置 ---
+plot.new() # 清空画布
+par(mar=c(1,1,3,1)) # 设置边距
+plot.window(xlim=c(0, 10), ylim=c(0, 10)) # 设置坐标系范围
+
+title(main="神经网络局部拓扑图 (前5个变量)", font.main=2)
+
+# 定义坐标
+# 输入层 (左侧): 5个节点纵向排列
+x_input <- rep(2, 5)
+y_input <- seq(8, 2, length.out=5)
+
+# 隐藏层 (中间): 5个节点纵向排列
+x_hidden <- rep(5, 5)
+y_hidden <- seq(8, 2, length.out=5)
+
+# 输出层 (右侧): 1个节点居中
+x_output <- 8
+y_output <- 5
+
+# --- 核心绘图逻辑：画连线 (权重) ---
+
+# 辅助函数：根据权重值获取颜色和线宽
+get_col <- function(w) { ifelse(w > 0, "blue", "red") } # 正蓝负红
+get_lwd <- function(w) { 0.5 + abs(w) * 3 } # 权重越大线越粗，底宽0.5
+
+# 1. 画 输入层 -> 隐藏层 的连线
+for (i in 1:5) {      # 遍历5个输入
+  for (j in 1:5) {    # 遍历5个隐藏节点
+    w_val <- w_in_hidden[i, j]
+    segments(x0 = x_input[i], y0 = y_input[i],
+             x1 = x_hidden[j], y1 = y_hidden[j],
+             col = get_col(w_val), 
+             lwd = get_lwd(w_val))
+    
+    # 可选：在连线中间标上具体数值（如果觉得太乱可以注释掉下面这行）
+    # text((x_input[i]+x_hidden[j])/2, (y_input[i]+y_hidden[j])/2, round(w_val,1), cex=0.6, col="gray40")
+  }
+}
+
+# 2. 画 隐藏层 -> 输出层 的连线
+for (j in 1:5) {      # 遍历5个隐藏节点
+  w_val <- w_hidden_out[j]
+  segments(x0 = x_hidden[j], y0 = y_hidden[j],
+           x1 = x_output, y1 = y_output,
+           col = get_col(w_val), 
+           lwd = get_lwd(w_val))
+}
+
+# --- 装饰逻辑：画节点 (圆圈和标签) ---
+
+# 绘制圆点的辅助函数
+draw_node <- function(x, y, label, bg_color="white") {
+  points(x, y, pch=21, cex=3, bg=bg_color, col="black", lwd=2)
+  text(x, y, label, cex=0.8)
+}
+
+# 画输入节点
+for(i in 1:5) draw_node(x_input[i], y_input[i], paste0("Var", i), "#E1F5FE") # 浅蓝底
+
+# 画隐藏节点
+for(i in 1:5) draw_node(x_hidden[i], y_hidden[i], paste0("H", i), "#FFF9C4") # 浅黄底
+
+# 画输出节点
+draw_node(x_output, y_output, "Target", "#E8F5E9") # 浅绿底
+
+# 添加图例说明
+legend("bottom", legend=c("正权重 (+)", "负权重 (-)"), 
+       col=c("blue", "red"), lty=1, lwd=2, horiz=TRUE, bty="n")
+```
+
+
+```{r}
+library(neuralnet)
+library(ggplot2)
+library(reshape2)
+
+# ==========================================
+# 1. 定义实验核心函数 (架构师封装)
+# ==========================================
+# 这个函数接受输入数据，训练网络，并画出每一层的分布
+# input_name: 只是为了图表标题好名字
+# input_data: 输入的X矩阵 (2000 x 5)
+run_distribution_experiment <- function(input_name, X_matrix) {
+  
+  # --- A. 数据准备 ---
+  n_samples <- nrow(X_matrix)
+  
+  # 生成一个简单的目标变量 Y
+  # 这里的 Y 并不重要，主要是为了让网络有东西可学，从而形成权重
+  # 假设 Y 是线性组合 + 噪声
+  true_weights <- c(1, 1, 1, 1, 1) 
+  Y <- X_matrix %*% true_weights + rnorm(n_samples)
+  
+  # 归一化 (神经网络标准动作)
+  # 注意：观察分布变化时，归一化会改变幅度，但不会改变“形状”的相对关系
+  normalize <- function(x) { (x - min(x)) / (max(x) - min(x)) }
+  
+  # 整合数据
+  df <- as.data.frame(cbind(X_matrix, Y))
+  colnames(df) <- c(paste0("In_", 1:5), "Target") # 命名 In_1 到 In_5
+  
+  # 对数据进行归一化处理
+  df_norm <- as.data.frame(lapply(df, normalize))
+  
+  # --- B. 训练神经网络 ---
+  print(paste("正在训练网络，输入分布:", input_name, "..."))
+  
+  formula_str <- paste("Target ~", paste(paste0("In_", 1:5), collapse = " + "))
+  
+  # 关键设置：
+  # hidden = 4: 设置4个隐藏神经元
+  # act.fct = "logistic": 默认激活函数是 Sigmoid。这非常重要！它会把数据挤压到 0-1 之间。
+  nn <- neuralnet(as.formula(formula_str), 
+                  data = df_norm, 
+                  hidden = c(4), 
+                  linear.output = TRUE, # 输出层做回归，保持线性
+                  stepmax = 1e6)
+  
+  # --- C. 提取隐藏层与输出层数据 ---
+  # compute() 返回一个列表，$neurons 包含了每一层的输出
+  # neurons[[1]] 是输入层 (含截距)
+  # neurons[[2]] 是第一层隐藏层的输出 (我们最关心的！)
+  # net.result 是最终输出
+  
+  comp_res <- compute(nn, df_norm[, 1:5])
+  
+  # 获取隐藏层数据 (2000行 x 4列)
+  hidden_layer_data <- comp_res$neurons[[2]] 
+  # 去掉第一列(截距项1)，保留真正的神经元输出
+  hidden_layer_data <- hidden_layer_data[, -1] 
+  colnames(hidden_layer_data) <- paste0("Hidden_", 1:4)
+  
+  # 获取输出层数据
+  output_data <- comp_res$net.result
+  colnames(output_data) <- "Output"
+  
+  # --- D. 可视化工程 ---
+  
+  # 1. 准备输入层数据用于绘图
+  melt_input <- melt(as.data.frame(X_matrix))
+  melt_input$Layer <- "1. 输入层 (原始分布)"
+  
+  # 2. 准备隐藏层数据用于绘图
+  melt_hidden <- melt(as.data.frame(hidden_layer_data))
+  melt_hidden$Layer <- "2. 隐藏层 (Sigmoid激活后)"
+  
+  # 3. 准备输出层数据用于绘图
+  melt_output <- melt(as.data.frame(output_data))
+  melt_output$Layer <- "3. 输出层 (线性组合)"
+  
+  # 4. 绘图：输入层分布
+  p1 <- ggplot(melt_input, aes(x=value, fill=variable)) +
+    geom_density(alpha=0.5) +
+    facet_wrap(~variable, scales="free") +
+    labs(title=paste(input_name, "- 输入层分布"), x="", y="密度") +
+    theme_minimal() + theme(legend.position="none")
+  
+  # 5. 绘图：隐藏层分布 (重头戏)
+  p2 <- ggplot(melt_hidden, aes(x=value, fill=variable)) +
+    geom_density(alpha=0.6) +
+    facet_wrap(~variable, scales="free") + # 每个神经元单独一个格子
+    labs(title=paste(input_name, "- 隐藏层神经元激活分布"), 
+         subtitle="观察数据经过权重加权和激活函数后的变形",
+         x="激活值 (Activation)", y="密度") +
+    theme_light() + theme(legend.position="none")
+    
+  # 6. 绘图：输出层
+  p3 <- ggplot(melt_output, aes(x=value)) +
+    geom_density(fill="purple", alpha=0.6) +
+    labs(title=paste(input_name, "- 最终输出分布"), x="预测值", y="密度") +
+    theme_minimal()
+  
+  # 打印图表
+  print(p1)
+  print(p2)
+  print(p3)
+}
+
+# ==========================================
+# 2. 执行实验：标准正态分布输入
+# ==========================================
+
+set.seed(42)
+n_obs <- 2000  # 规模加大到 2000
+n_vars <- 5
+
+# 生成标准正态分布 N(0, 1)
+X_normal <- matrix(rnorm(n_obs * n_vars), ncol = n_vars)
+
+# 运行实验
+run_distribution_experiment("标准正态分布", X_normal)
+```
+
+
+```{r}
+library(neuralnet)
+library(ggplot2)
+library(reshape2)
+
+# ==========================================
+# 1. 准备固定输入数据 (Control Variable)
+# ==========================================
+# 保持输入 X 不变，只改变生成 Y 的逻辑
+set.seed(2024)
+n_obs <- 2000
+X_matrix <- matrix(rnorm(n_obs * 5), ncol = 5)
+colnames(X_matrix) <- paste0("Var", 1:5)
+
+# 归一化函数
+normalize <- function(x) { (x - min(x)) / (max(x) - min(x)) }
+
+# 存储所有实验结果的容器
+all_experiments_data <- data.frame()
+
+# ==========================================
+# 2. 循环实验：权重从 0 增加到 5
+# ==========================================
+weights_to_test <- 0:5 # 测试序列: 0, 1, 2, 3, 4, 5
+
+for (w_val in weights_to_test) {
+  
+  print(paste("正在进行实验: Var1 权重 =", w_val))
+  
+  # --- A. 动态生成目标变量 Y ---
+  # 只有 Var1 有权重，其他变量权重为 0
+  # Y = w * Var1 + 0*others + Noise
+  Y <- w_val * X_matrix[, 1] + rnorm(n_obs)
+  
+  # 组合并归一化
+  data_temp <- as.data.frame(cbind(X_matrix, Target = Y))
+  data_norm <- as.data.frame(lapply(data_temp, normalize))
+  
+  # --- B. 训练神经网络 ---
+  # 为了控制变量，我们固定隐藏层为 3 个神经元
+  # 使用 logistic (sigmoid) 作为激活函数
+  nn <- neuralnet(Target ~ Var1 + Var2 + Var3 + Var4 + Var5, 
+                  data = data_norm, 
+                  hidden = c(3), 
+                  linear.output = TRUE,
+                  stepmax = 1e6,
+                  threshold = 0.05) # 稍微放宽阈值加速收敛
+  
+  # --- C. 提取隐藏层分布 ---
+  # 计算隐藏层输出
+  comp <- compute(nn, data_norm[, 1:5])
+  hidden_out <- comp$neurons[[2]][, -1] # 去掉截距
+  
+  # 整理数据格式
+  # 我们把这3个神经元的数据拉长，打上标签
+  melted_hidden <- melt(hidden_out)
+  colnames(melted_hidden) <- c("RowID", "Neuron_ID", "Activation")
+  
+  # 添加本次实验的标签 (Signal_Strength)
+  melted_hidden$Signal_Strength <- paste("Weight of Var1 =", w_val)
+  
+  # 存入总表
+  all_experiments_data <- rbind(all_experiments_data, melted_hidden)
+}
+
+
+```
+
+```{r}
+# ==========================================
+# 3. 可视化：分布演变图谱 (修正版)
+# ==========================================
+
+# --- 关键修正步骤 ---
+# 将 Neuron_ID 转换为因子 (Factor)，明确告诉 ggplot 这是分类变量
+all_experiments_data$Neuron_ID <- as.factor(all_experiments_data$Neuron_ID)
+
+# 确保 Signal_Strength 的排序正确 (0 -> 5)
+all_experiments_data$Signal_Strength <- factor(all_experiments_data$Signal_Strength, 
+                                               levels = paste("Weight of Var1 =", 0:5))
+
+# 绘制密度图
+ggplot(all_experiments_data, aes(x = Activation, fill = Neuron_ID)) +
+  geom_density(alpha = 0.6, color = NA) +
+  # 行=信号强度，列=神经元ID
+  facet_grid(Signal_Strength ~ Neuron_ID) + 
+  scale_x_continuous(limits = c(0, 1), breaks = c(0, 0.5, 1)) +
+  # 现在它是因子了，scale_fill_brewer 就能正常工作了
+  scale_fill_brewer(palette = "Set1") +
+  labs(title = "神经网络隐藏层激活分布的演变",
+       subtitle = "观察：随着 Var1 信号增强，神经元如何从'正态'变为'饱和(U型)'",
+       x = "激活值 (Sigmoid Output: 0 to 1)",
+       y = "密度 (Density)",
+       fill = "神经元 ID") +
+  theme_bw() +
+  theme(strip.text.y = element_text(angle = 0), # 让右侧标签横过来读
+        legend.position = "none") # 既然分面了，图例其实可以隐藏
+```
+```{r}
+library(neuralnet)
+library(ggplot2)
+library(reshape2)
+
+# ==========================================
+# 1. 准备工作
+# ==========================================
+set.seed(2026)
+n_obs <- 3000
+# 生成固定输入 X
+X_matrix <- matrix(rnorm(n_obs * 5), ncol = 5)
+colnames(X_matrix) <- paste0("Var", 1:5)
+
+# 归一化函数
+normalize <- function(x) { (x - min(x)) / (max(x) - min(x)) }
+
+# 数据容器
+final_data <- data.frame()
+
+# ==========================================
+# 2. 循环实验：权重 0 -> 5
+# ==========================================
+weights_to_test <- 0:5
+
+for (w_val in weights_to_test) {
+  
+  # --- A. 制造目标变量 ---
+  # Y = w * Var1 + 噪声
+  # 注意：这里我们保留原始 Y 用于对比，不进行归一化，
+  # 但神经网络训练时用的是归一化后的数据。
+  Y_raw <- w_val * X_matrix[, 1] + rnorm(n_obs)
+  
+  # 准备训练集
+  data_temp <- as.data.frame(cbind(X_matrix, Target = Y_raw))
+  data_norm <- as.data.frame(lapply(data_temp, normalize))
+  
+  # --- B. 训练网络 ---
+  # 隐藏层 = 3个节点
+  nn <- neuralnet(Target ~ Var1 + Var2 + Var3 + Var4 + Var5, 
+                  data = data_norm, 
+                  hidden = c(3), 
+                  linear.output = TRUE, 
+                  stepmax = 1e6, threshold = 0.05)
+  
+  # --- C. 捕获内部状态 (Hidden Layers) ---
+  comp <- compute(nn, data_norm[, 1:5])
+  
+  # 1. 提取隐藏层 (Sigmoid激活: 0~1)
+  hidden_vals <- comp$neurons[[2]][, -1] # 去掉截距
+  colnames(hidden_vals) <- paste0("Hidden_Neuron_", 1:3)
+  
+  # 2. 提取输出层 (线性输出: 范围不固定)
+  # 注意：这是归一化后的预测值
+  output_vals <- comp$net.result
+  colnames(output_vals) <- "Final_Output"
+  
+  # --- D. 数据清洗与合并 ---
+  # 将隐藏层和输出层合并在一起，方便画图
+  # 格式: [Weight_Level, Node_Type, Node_Name, Value]
+  
+  # 处理隐藏层
+  df_hidden <- melt(as.data.frame(hidden_vals))
+  df_hidden$Type <- "1. Hidden Layer (Sigmoid)"
+  df_hidden$Weight_Level <- factor(w_val)
+  
+  # 处理输出层
+  df_output <- melt(as.data.frame(output_vals))
+  df_output$Type <- "2. Output Layer (Linear)"
+  df_output$Weight_Level <- factor(w_val)
+  
+  # 合并
+  final_data <- rbind(final_data, df_hidden, df_output)
+}
+
+# ==========================================
+# 3. 可视化：全景小提琴图
+# ==========================================
+
+# 这是一个高级技巧：
+# 因为隐藏层是 0-1，输出层可能是 0-5 甚至更大，
+# 如果画在一起，隐藏层会被压扁。
+# 所以我们用 scales = "free_y" 让它们各自拥有独立的 Y 轴范围。
+
+ggplot(final_data, aes(x = Weight_Level, y = value, fill = Weight_Level)) +
+  # 画小提琴
+  geom_violin(trim = FALSE, scale = "width", alpha = 0.7) +
+  # 画箱线图在里面，展示中位数
+  geom_boxplot(width = 0.1, color = "black", alpha = 0.5, outlier.shape = NA) +
+  
+  # 关键：分面展示
+  # 行：节点类型 (隐藏层 vs 输出层)
+  # 列：具体的节点名称
+  facet_wrap(~ variable, scales = "free_y", nrow = 1) +
+  
+  scale_fill_brewer(palette = "Blues") +
+  labs(title = "神经网络内部与外部的协同演化",
+       subtitle = "X轴: Var1的权重逐渐增加 (0->5) | Y轴: 激活值/预测值分布",
+       x = "信号强度 (权重大小)",
+       y = "数值分布 (注意Y轴刻度不同)") +
+  theme_minimal() +
+  theme(legend.position = "none",
+        strip.text = element_text(size = 12, face = "bold"),
+        axis.text.x = element_text(face = "bold"))
+```
+
+```{r}
+library(neuralnet)
+library(ggplot2)
+library(reshape2)
+
+# ==========================================
+# 1. 实验参数设置
+# ==========================================
+n_repeats <- 20    # 重复实验次数 (蒙特卡洛)
+n_obs <- 1000      # 单次实验样本数 (稍微减少以加快速度)
+weights_to_test <- 0:5
+
+# 存储大数据的容器
+total_simulation_data <- data.frame()
+
+print(paste("开始进行蒙特卡洛模拟，总共重复:", n_repeats, "次..."))
+
+# ==========================================
+# 2. 双重循环：重复次数 x 信号强度
+# ==========================================
+
+for (rep_i in 1:n_repeats) {
+  
+  # 打印进度
+  if (rep_i %% 5 == 0) print(paste("正在执行第", rep_i, "次重复实验..."))
+  
+  # 每次重复都使用新的随机种子，确保数据和网络初始化不同
+  set.seed(2024 + rep_i) 
+  
+  # 生成基础数据 X
+  X_matrix <- matrix(rnorm(n_obs * 5), ncol = 5)
+  colnames(X_matrix) <- paste0("Var", 1:5)
+  
+  # 归一化函数
+  normalize <- function(x) { (x - min(x)) / (max(x) - min(x)) }
+  
+  for (w_val in weights_to_test) {
+    
+    # --- A. 生成数据 ---
+    Y_raw <- w_val * X_matrix[, 1] + rnorm(n_obs)
+    data_temp <- as.data.frame(cbind(X_matrix, Target = Y_raw))
+    data_norm <- as.data.frame(lapply(data_temp, normalize))
+    
+    # --- B. 训练网络 (Hidden = 2) ---
+    # 减少隐藏节点到2个，迫使它们更有效地编码
+    nn <- neuralnet(Target ~ Var1 + Var2 + Var3 + Var4 + Var5, 
+                    data = data_norm, 
+                    hidden = c(2), 
+                    linear.output = TRUE, 
+                    threshold = 0.1, # 适当放宽加速
+                    stepmax = 1e5)
+    
+    # --- C. 提取数据 ---
+    comp <- compute(nn, data_norm[, 1:5])
+    
+    # 1. 隐藏层数据
+    # 关键策略：我们将 Hidden1 和 Hidden2 的数据混合！
+    # 因为在多次实验中，哪个是1哪个是2是随机的，没有意义。
+    # 我们关心的是“隐藏层整体”表现出的分布特征。
+    h_vals <- as.vector(comp$neurons[[2]][, -1]) # 拉平成一个长向量
+    
+    # 2. 输出层数据
+    o_vals <- as.vector(comp$net.result)
+    
+    # --- D. 存入数据框 ---
+    
+    # 存储隐藏层 (标记为 Hidden Layer)
+    df_h <- data.frame(
+      Value = h_vals,
+      Type = "Hidden Layer (Generic)",
+      Signal_Strength = w_val,
+      Repetition = rep_i
+    )
+    
+    # 存储输出层 (标记为 Final Output)
+    df_o <- data.frame(
+      Value = o_vals,
+      Type = "Final Output",
+      Signal_Strength = w_val,
+      Repetition = rep_i
+    )
+    
+    total_simulation_data <- rbind(total_simulation_data, df_h, df_o)
+  }
+}
+
+# ==========================================
+# 3. 可视化：聚合分布 (Averaged Distribution)
+# ==========================================
+
+# 因子化信号强度
+total_simulation_data$Signal_Strength <- factor(total_simulation_data$Signal_Strength)
+
+print("正在绘图...")
+
+ggplot(total_simulation_data, aes(x = Signal_Strength, y = Value, fill = Type)) +
+  # 使用小提琴图展示分布的密度
+  # draw_quantiles 绘制中位数线
+  geom_violin(scale = "width", trim = FALSE, draw_quantiles = c(0.5), alpha = 0.8) +
+  
+  # 分面展示：左边是隐藏层整体分布，右边是输出层
+  facet_wrap(~ Type, scales = "free_y") +
+  
+  scale_fill_manual(values = c("goldenrod", "steelblue")) +
+  
+  labs(title = "蒙特卡洛神经网络分布演化 (重复20次取平均)",
+       subtitle = "左图：隐藏神经元(Sigmoid)倾向于向两端极化 | 右图：输出(Linear)从尖峰变平坦",
+       x = "信号强度 (Var1 权重 0->5)",
+       y = "数值分布 (聚合后的概率密度)") +
+  
+  theme_dark() + # 使用深色主题对比更强烈
+  theme(legend.position = "none",
+        strip.text = element_text(size = 14, face = "bold"),
+        axis.text = element_text(size = 11))
+```
+
+```{r}
+library(neuralnet)
+library(ggplot2)
+library(reshape2)
+
+# ==========================================
+# 1. 实验设置
+# ==========================================
+n_repeats <- 20     # 重复20次，消除偶然性
+n_obs <- 1000       # 每次1000条数据
+weights_to_test <- 0:5
+
+# 容器：这次我们要严格区分 Neuron_1 和 Neuron_2
+final_data <- data.frame()
+
+print(paste("开始双神经元独立追踪实验，重复次数:", n_repeats))
+
+# ==========================================
+# 2. 循环实验
+# ==========================================
+for (rep_i in 1:n_repeats) {
+  
+  if (rep_i %% 5 == 0) print(paste("进度: 第", rep_i, "次模拟..."))
+  set.seed(2024 + rep_i) # 变动种子
+  
+  # 生成数据
+  X_matrix <- matrix(rnorm(n_obs * 5), ncol = 5)
+  colnames(X_matrix) <- paste0("Var", 1:5)
+  normalize <- function(x) { (x - min(x)) / (max(x) - min(x)) }
+  
+  for (w_val in weights_to_test) {
+    
+    # 构建 Y
+    Y_raw <- w_val * X_matrix[, 1] + rnorm(n_obs)
+    data_temp <- as.data.frame(cbind(X_matrix, Target = Y_raw))
+    data_norm <- as.data.frame(lapply(data_temp, normalize))
+    
+    # 训练网络：必须指定 hidden = 2
+    nn <- neuralnet(Target ~ Var1 + Var2 + Var3 + Var4 + Var5, 
+                    data = data_norm, 
+                    hidden = c(2), 
+                    linear.output = TRUE, 
+                    threshold = 0.1, 
+                    stepmax = 1e5)
+    
+    # 提取结果
+    comp <- compute(nn, data_norm[, 1:5])
+    
+    # --- 关键修改：分别提取 Hidden 1 和 Hidden 2 ---
+    # neurons[[2]] 的列是: [Intercept, Node1, Node2]
+    h1_vals <- comp$neurons[[2]][, 2] # 取第2列 (Node 1)
+    h2_vals <- comp$neurons[[2]][, 3] # 取第3列 (Node 2)
+    out_vals <- comp$net.result[, 1]  # 输出层
+    
+    # 临时数据框
+    # 我们把 H1, H2, Output 设为三个独立的类别
+    df_h1 <- data.frame(Value = h1_vals, Node = "1. Hidden Unit A", Signal = w_val)
+    df_h2 <- data.frame(Value = h2_vals, Node = "2. Hidden Unit B", Signal = w_val)
+    df_out <- data.frame(Value = out_vals, Node = "3. Final Output", Signal = w_val)
+    
+    final_data <- rbind(final_data, df_h1, df_h2, df_out)
+  }
+}
+
+# ==========================================
+# 3. 可视化：三列对比 (Hidden A vs Hidden B vs Output)
+# ==========================================
+
+final_data$Signal <- factor(final_data$Signal)
+
+ggplot(final_data, aes(x = Signal, y = Value, fill = Node)) +
+  # 小提琴图：展示分布形状
+  geom_violin(scale = "width", trim = FALSE, alpha = 0.7, draw_quantiles = 0.5) +
+  
+  # 关键布局：分成3列，独立展示 H1, H2, Output
+  facet_wrap(~ Node, scales = "free_y", nrow = 1) +
+  
+  # 配色方案
+  scale_fill_manual(values = c("#E69F00", "#56B4E9", "#009E73")) +
+  
+  labs(title = "双隐层神经元独立演化图 (20次实验聚合)",
+       subtitle = "观察 Hidden A 和 Hidden B 的分布是否一致？(对称性破缺)",
+       x = "信号强度 (Var1 权重)",
+       y = "激活值/输出值分布") +
+  
+  theme_bw() +
+  theme(legend.position = "none",
+        strip.text = element_text(size = 14, face = "bold"),
+        axis.title = element_text(size = 12))
+```
+
+
+```{r}
+if (!require("showtext")) install.packages("showtext")
+
+library(showtext)
+
+library(ggplot2)
+
+# 加载macOS系统中文黑体（以苹方字体为例） 
+
+font_path <- "/System/Library/Fonts/Supplemental/Songti.ttc" # 系统内置路径
+
+font_add("Songti", font_path) 
+
+showtext_auto() # 启用字体渲染
+
+# 创建支持中文的ggplot主题
+
+theme_cn <- theme_minimal() +
+
+ theme(
+
+ text = element_text(family = "Songti"), # 全局字体
+
+ axis.title = element_text(size = 12),
+
+ axis.text = element_text(size = 10),
+
+ plot.title = element_text(hjust = 0.5, face = "bold")
+
+ )
+```
+
+

@@ -1,0 +1,639 @@
+---
+title: "robutness"
+output: html_document
+---
+
+这个文件旨在研究UniLasso在正态分布数据的均值和方差变化时的表现如何
+
+# 均值方差实验
+```{r}
+library(MASS)
+library(glmnet)
+library(ggplot2)
+library(gridExtra)
+library(dplyr)
+
+# ==========================================
+# 1. 动态数据工厂
+# ==========================================
+generate_dynamic_data <- function(n, p, mu_x, sd_x, sigma_noise = 1) {
+  # 生成 X ~ N(mu_x, sd_x^2)
+  X <- matrix(rnorm(n * p, mean = mu_x, sd = sd_x), n, p)
+  colnames(X) <- paste0("V", 1:p)
+  
+  # 真实系数: 前10个为2
+  beta_true <- rep(0, p)
+  beta_true[1:10] <- 2
+  true_support <- 1:10
+  
+  # Y = X * beta + noise
+  # 注意：由于 X 的变化，Y 的均值和方差也会随之剧烈变化
+  Y <- X %*% beta_true + rnorm(n, 0, sigma_noise)
+  
+  return(list(X = X, Y = Y, true_support = true_support))
+}
+
+# 辅助函数：计算 Sensitivity (TPR)
+get_sensitivity <- function(fit, true_support, p, s="lambda.min") {
+  coefs <- as.numeric(coef(fit, s=s))[-1] # 去除截距
+  active <- which(coefs != 0)
+  if(length(active) == 0) return(0)
+  tp <- length(intersect(active, true_support))
+  return(tp / length(true_support))
+}
+
+# 辅助函数：计算 MSE
+get_mse <- function(fit, newx, newy, s="lambda.min") {
+  pred <- predict(fit, newx=newx, s=s)
+  mean((newy - pred)^2)
+}
+
+# ==========================================
+# 2. 实验 A: 均值漂移测试 (Mean Shift)
+# ==========================================
+# 固定 SD=1，让 Mean 从 -50 变到 50
+means_seq <- seq(-50, 50, by = 10)
+B <- 30 # 重复次数
+p <- 100
+n_train <- 200
+n_test <- 1000
+
+res_mean <- data.frame()
+
+cat("开始实验 A: 均值变化测试 (Mean: -50 -> 50)...\n")
+pb <- txtProgressBar(min=0, max=length(means_seq), style=3)
+
+for(i in seq_along(means_seq)) {
+  mu <- means_seq[i]
+  for(b in 1:B) {
+    # SD 固定为 1
+    train <- generate_dynamic_data(n_train, p, mu_x = mu, sd_x = 1)
+    test <- generate_dynamic_data(n_test, p, mu_x = mu, sd_x = 1)
+    
+    # UniLasso
+    fit_uni <- cv.uniLasso(train$X, train$Y, family="gaussian")
+    mse_uni <- get_mse(fit_uni, test$X, test$Y)
+    sens_uni <- get_sensitivity(fit_uni, train$true_support, p)
+    
+    # Lasso
+    fit_lasso <- cv.glmnet(train$X, train$Y, family="gaussian")
+    mse_lasso <- get_mse(fit_lasso, test$X, test$Y)
+    sens_lasso <- get_sensitivity(fit_lasso, train$true_support, p)
+    
+    res_mean <- rbind(res_mean, data.frame(
+      Value = mu, Method = "UniLasso", MSE = mse_uni, Sensitivity = sens_uni, Type = "Mean"
+    ))
+    res_mean <- rbind(res_mean, data.frame(
+      Value = mu, Method = "Lasso", MSE = mse_lasso, Sensitivity = sens_lasso, Type = "Mean"
+    ))
+  }
+  setTxtProgressBar(pb, i)
+}
+close(pb)
+
+# ==========================================
+# 3. 实验 B: 方差缩放测试 (Variance Scaling)
+# ==========================================
+# 固定 Mean=0，让 SD 从 0.1 变到 10
+# 注意：当 SD 很小时，信号 X*beta 会很弱，此时 MSE 主要是噪音
+sds_seq <- seq(0.1, 20, by = 0.5) 
+
+res_sd <- data.frame()
+
+cat("\n开始实验 B: 方差变化测试 (SD: 0.1 -> 10)...\n")
+pb <- txtProgressBar(min=0, max=length(sds_seq), style=3)
+
+for(i in seq_along(sds_seq)) {
+  sd_val <- sds_seq[i]
+  for(b in 1:B) {
+    # Mean 固定为 0
+    train <- generate_dynamic_data(n_train, p, mu_x = 0, sd_x = sd_val)
+    test <- generate_dynamic_data(n_test, p, mu_x = 0, sd_x = sd_val)
+    
+    # UniLasso
+    fit_uni <- cv.uniLasso(train$X, train$Y, family="gaussian")
+    mse_uni <- get_mse(fit_uni, test$X, test$Y)
+    sens_uni <- get_sensitivity(fit_uni, train$true_support, p)
+    
+    # Lasso
+    fit_lasso <- cv.glmnet(train$X, train$Y, family="gaussian")
+    mse_lasso <- get_mse(fit_lasso, test$X, test$Y)
+    sens_lasso <- get_sensitivity(fit_lasso, train$true_support, p)
+    
+    res_sd <- rbind(res_sd, data.frame(
+      Value = sd_val, Method = "UniLasso", MSE = mse_uni, Sensitivity = sens_uni, Type = "SD"
+    ))
+    res_sd <- rbind(res_sd, data.frame(
+      Value = sd_val, Method = "Lasso", MSE = mse_lasso, Sensitivity = sens_lasso, Type = "SD"
+    ))
+  }
+  setTxtProgressBar(pb, i)
+}
+close(pb)
+
+# ==========================================
+# 4. 可视化分析
+# ==========================================
+
+# 预处理数据：计算均值和标准误以便画线图
+summ_mean <- res_mean %>% group_by(Value, Method) %>% 
+  summarise(Avg_MSE = mean(MSE), Avg_Sens = mean(Sensitivity))
+
+summ_sd <- res_sd %>% group_by(Value, Method) %>% 
+  summarise(Avg_MSE = mean(MSE), Avg_Sens = mean(Sensitivity))
+
+# --- 图组 A: 均值 (Mean) 的影响 ---
+p_mean_mse <- ggplot(summ_mean, aes(x=Value, y=Avg_MSE, color=Method)) +
+  geom_line(size=1) + geom_point() +
+  labs(title="Impact of Feature Mean on MSE", x="Mean of X", y="Test MSE") +
+  theme_minimal() + scale_color_manual(values=c("#56B4E9", "#E69F00"))
+
+p_mean_sens <- ggplot(summ_mean, aes(x=Value, y=Avg_Sens, color=Method)) +
+  geom_line(size=1) + geom_point() +
+  ylim(0, 1.1) +
+  labs(title="Impact of Feature Mean on Sensitivity", x="Mean of X", y="Sensitivity") +
+  theme_minimal() + scale_color_manual(values=c("#56B4E9", "#E69F00"))
+
+# --- 图组 B: 方差 (SD) 的影响 ---
+p_sd_mse <- ggplot(summ_sd, aes(x=Value, y=Avg_MSE, color=Method)) +
+  geom_line(size=1) + geom_point() +
+  labs(title="Impact of Feature SD on MSE", 
+       subtitle="Low SD = Low Signal-to-Noise Ratio", x="Standard Deviation of X", y="Test MSE") +
+  theme_minimal() + scale_color_manual(values=c("#56B4E9", "#E69F00"))
+
+p_sd_sens <- ggplot(summ_sd, aes(x=Value, y=Avg_Sens, color=Method)) +
+  geom_line(size=1) + geom_point() +
+  ylim(0, 1.1) +
+  labs(title="Impact of Feature SD on Sensitivity", x="Standard Deviation of X", y="Sensitivity") +
+  theme_minimal() + scale_color_manual(values=c("#56B4E9", "#E69F00"))
+
+# 组合展示
+grid.arrange(p_mean_mse, p_mean_sens, p_sd_mse, p_sd_sens, 
+             ncol=2, nrow=2, 
+             top="Sensitivity Analysis: Varying Mean (Top) and Variance (Bottom)")
+```
+* 随着方差逐渐增大，UniLasso的方差越来越大啊，为什么呢？
+* 训练数据量的增大并没有解决这个问题
+
+
+# 修复量纲
+```{r}
+library(MASS)
+library(glmnet)
+library(ggplot2)
+library(dplyr)
+
+# ==========================================
+# 1. 动态方差数据工厂
+# ==========================================
+generate_variance_data <- function(n, p, sd_x, sigma_noise = 1) {
+  # 均值固定为 0，只改变 SD
+  X <- matrix(rnorm(n * p, mean = 0, sd = sd_x), n, p)
+  colnames(X) <- paste0("V", 1:p)
+  
+  # 真实系数
+  beta_true <- rep(0, p)
+  beta_true[1:10] <- 2
+  true_support <- 1:10
+  
+  # Y 会随着 X 的方差增大而剧烈增大
+  Y <- X %*% beta_true + rnorm(n, 0, sigma_noise)
+  
+  return(list(X = X, Y = Y, true_support = true_support))
+}
+
+# MSE 计算辅助函数
+get_mse <- function(fit, newx, newy, s="lambda.min") {
+  pred <- predict(fit, newx=newx, s=s)
+  mean((newy - pred)^2)
+}
+
+# ==========================================
+# 2. 对比实验：SD 变化 (0.5 -> 5.0)
+# ==========================================
+sds_seq <- seq(0.5, 5.0, by = 0.5) 
+B <- 20 # 重复次数
+n_train <- 300
+n_test <- 1000
+p <- 100
+
+results <- data.frame()
+
+cat("开始 Scale 敏感度实验 (SD: 0.5 -> 5.0)...\n")
+pb <- txtProgressBar(min=0, max=length(sds_seq), style=3)
+
+for(i in seq_along(sds_seq)) {
+  sd_val <- sds_seq[i]
+  
+  for(b in 1:B) {
+    # 生成数据
+    train <- generate_variance_data(n_train, p, sd_x = sd_val)
+    test <- generate_variance_data(n_test, p, sd_x = sd_val)
+    
+    # 1. Lasso (基准线, 默认 standardize=TRUE)
+    fit_lasso <- cv.glmnet(train$X, train$Y, family="gaussian")
+    mse_lasso <- get_mse(fit_lasso, test$X, test$Y)
+    
+    # 2. UniLasso (默认: standardize=FALSE)
+    # 这就是你观察到 MSE 飙升的那一组
+    fit_uni_default <- cv.uniLasso(train$X, train$Y, family="gaussian", standardize=FALSE)
+    mse_uni_def <- get_mse(fit_uni_default, test$X, test$Y)
+    
+    # 3. UniLasso (修复: standardize=TRUE)
+    # 我们强制开启标准化，看看能否解决问题
+    fit_uni_std <- cv.uniLasso(train$X, train$Y, family="gaussian", standardize=TRUE)
+    mse_uni_std <- get_mse(fit_uni_std, test$X, test$Y)
+    
+    # 收集数据
+    results <- rbind(results, data.frame(SD = sd_val, Method = "Lasso", MSE = mse_lasso))
+    results <- rbind(results, data.frame(SD = sd_val, Method = "UniLasso (Default)", MSE = mse_uni_def))
+    results <- rbind(results, data.frame(SD = sd_val, Method = "UniLasso (With Std)", MSE = mse_uni_std))
+  }
+  setTxtProgressBar(pb, i)
+}
+close(pb)
+
+# ==========================================
+# 3. 可视化
+# ==========================================
+# 计算均值以便画线
+summary_df <- results %>% 
+  group_by(SD, Method) %>% 
+  summarise(Avg_MSE = mean(MSE), .groups = 'drop')
+
+ggplot(summary_df, aes(x = SD, y = Avg_MSE, color = Method, linetype = Method)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("Lasso" = "#56B4E9", 
+                                "UniLasso (Default)" = "red", 
+                                "UniLasso (With Std)" = "#E69F00")) +
+  scale_linetype_manual(values = c("Lasso" = "solid", 
+                                   "UniLasso (Default)" = "dashed", 
+                                   "UniLasso (With Std)" = "solid")) +
+  labs(title = "The Effect of Standardization on Numerical Stability",
+       subtitle = "Why UniLasso failed as Variance increased, and how to fix it.",
+       x = "Standard Deviation of Features (Data Scale)",
+       y = "Test Mean Squared Error (MSE)") +
+  theme_minimal() +
+  theme(legend.position = "bottom", plot.title = element_text(face="bold"))
+```
+
+* n = p = 100 坏了没有得到修复
+* 数据量的增大也没有缓解
+
+# AI修复版
+```{r}
+library(MASS)
+library(glmnet)
+library(ggplot2)
+library(dplyr)
+
+# 数据工厂 (保持不变)
+generate_variance_data <- function(n, p, sd_x, sigma_noise = 1) {
+  X <- matrix(rnorm(n * p, mean = 0, sd = sd_x), n, p)
+  colnames(X) <- paste0("V", 1:p)
+  beta_true <- rep(0, p); beta_true[1:10] <- 2
+  Y <- X %*% beta_true + rnorm(n, 0, sigma_noise)
+  return(list(X = X, Y = Y))
+}
+
+# 辅助函数: MSE
+get_mse <- function(fit, newx, newy, s="lambda.min") {
+  pred <- predict(fit, newx=newx, s=s)
+  mean((newy - pred)^2)
+}
+
+# 实验设置
+sds_seq <- seq(0.5, 5.0, by = 0.5) 
+B <- 20 
+n_train <- 100
+n_test <- 1000
+p <- 100
+
+results <- data.frame()
+
+cat("开始手动标准化修复实验 (SD: 0.5 -> 5.0)...\n")
+pb <- txtProgressBar(min=0, max=length(sds_seq), style=3)
+
+for(i in seq_along(sds_seq)) {
+  sd_val <- sds_seq[i]
+  
+  for(b in 1:B) {
+    # 原始数据 (High Variance)
+    train <- generate_variance_data(n_train, p, sd_x = sd_val)
+    test <- generate_variance_data(n_test, p, sd_x = sd_val)
+    
+    # 1. Lasso (基准)
+    fit_lasso <- cv.glmnet(train$X, train$Y, family="gaussian")
+    mse_lasso <- get_mse(fit_lasso, test$X, test$Y)
+    
+    # 2. UniLasso (之前失败的 Default)
+    fit_uni_def <- cv.uniLasso(train$X, train$Y, family="gaussian")
+    mse_uni_def <- get_mse(fit_uni_def, test$X, test$Y)
+    
+    # 3. UniLasso (手动标准化 X 和 Y)
+    # --- Manual Scaling Start ---
+    # 记录均值和方差以便还原
+    mean_X <- colMeans(train$X); sd_X <- apply(train$X, 2, sd)
+    mean_Y <- mean(train$Y); sd_Y <- sd(train$Y)
+    
+    # 训练集标准化 (Scale to Mean=0, SD=1)
+    X_scaled <- scale(train$X)
+    Y_scaled <- scale(train$Y)
+    
+    # 训练模型
+    fit_uni_manual <- cv.uniLasso(X_scaled, Y_scaled, family="gaussian")
+    
+    # 测试集预测 (需要极度小心)
+    # A. 先将测试集 X 标准化 (使用训练集的参数!)
+    X_test_scaled <- scale(test$X, center = mean_X, scale = sd_X)
+    
+    # B. 预测 (得到的是 Scaled Y 的预测值)
+    pred_scaled <- predict(fit_uni_manual, newx = X_test_scaled, s="lambda.min")
+    
+    # C. 还原 Y (反标准化)
+    pred_final <- pred_scaled * sd_Y + mean_Y
+    
+    # 计算 MSE
+    mse_uni_manual <- mean((test$Y - pred_final)^2)
+    # --- Manual Scaling End ---
+    
+    results <- rbind(results, data.frame(SD = sd_val, Method = "Lasso", MSE = mse_lasso))
+    results <- rbind(results, data.frame(SD = sd_val, Method = "UniLasso (Default)", MSE = mse_uni_def))
+    results <- rbind(results, data.frame(SD = sd_val, Method = "UniLasso (Manual Scale)", MSE = mse_uni_manual))
+  }
+  setTxtProgressBar(pb, i)
+}
+close(pb)
+
+# 可视化
+summary_df <- results %>% group_by(SD, Method) %>% summarise(Avg_MSE = mean(MSE), .groups = 'drop')
+
+ggplot(summary_df, aes(x = SD, y = Avg_MSE, color = Method, linetype = Method)) +
+  geom_line(size = 1.2) + geom_point(size = 3) +
+  scale_color_manual(values = c("#56B4E9", "red", "darkgreen")) +
+  labs(title = "Manual Standardization vs Default",
+       subtitle = "Manually scaling X and Y solves the numerical instability caused by collinearity.",
+       x = "Standard Deviation of Features", y = "Test MSE") +
+  theme_minimal()
+```
+* p = n = 100的时候，对变量进行简单的标准化，还是无法修复，
+
+
+# 关闭LOO可以修复
+
+```{r}
+library(MASS)
+library(glmnet)
+library(ggplot2)
+library(dplyr)
+
+# ==========================================
+# 1. 数据工厂 (保持不变)
+# ==========================================
+generate_variance_data <- function(n, p, sd_x, sigma_noise = 1) {
+  X <- matrix(rnorm(n * p, mean = 0, sd = sd_x), n, p)
+  colnames(X) <- paste0("V", 1:p)
+  beta_true <- rep(0, p); beta_true[1:10] <- 2
+  # Y 的方差随 sd_x 剧烈增加
+  Y <- X %*% beta_true + rnorm(n, 0, sigma_noise)
+  return(list(X = X, Y = Y))
+}
+
+# MSE 计算
+get_mse <- function(fit, newx, newy, s="lambda.min") {
+  pred <- predict(fit, newx=newx, s=s)
+  mean((newy - pred)^2)
+}
+
+# ==========================================
+# 2. 对比实验：LOO vs No-LOO
+# ==========================================
+sds_seq <- seq(0.5, 5.0, by = 0.5) 
+B <- 20 
+n_train <- 100
+n_test <- 1000
+p <- 100
+
+results <- data.frame()
+
+cat("开始 LOO 机制验证实验 (SD: 0.5 -> 5.0)...\n")
+pb <- txtProgressBar(min=0, max=length(sds_seq), style=3)
+
+for(i in seq_along(sds_seq)) {
+  sd_val <- sds_seq[i]
+  
+  for(b in 1:B) {
+    # 生成数据
+    train <- generate_variance_data(n_train, p, sd_x = sd_val)
+    test <- generate_variance_data(n_test, p, sd_x = sd_val)
+    
+    # 1. Lasso (基准)
+    fit_lasso <- cv.glmnet(train$X, train$Y, family="gaussian")
+    mse_lasso <- get_mse(fit_lasso, test$X, test$Y)
+    
+    # 2. UniLasso (Default: loo=TRUE)
+    # 强制开启 standardize=TRUE 以排除简单的量纲问题，专注于架构问题
+    fit_uni_loo <- cv.uniLasso(train$X, train$Y, family="gaussian", 
+                               standardize=TRUE, loo=TRUE)
+    mse_uni_loo <- get_mse(fit_uni_loo, test$X, test$Y)
+    
+    # 3. UniLasso (Modified: loo=FALSE)
+    # 关闭 LOO，这将使其退化为一种 Adaptive Lasso
+    fit_uni_no_loo <- cv.uniLasso(train$X, train$Y, family="gaussian", 
+                                  standardize=TRUE, loo=FALSE)
+    mse_uni_no_loo <- get_mse(fit_uni_no_loo, test$X, test$Y)
+    
+    # 收集结果
+    results <- rbind(results, data.frame(SD = sd_val, Method = "Lasso", MSE = mse_lasso))
+    results <- rbind(results, data.frame(SD = sd_val, Method = "UniLasso (LOO=TRUE)", MSE = mse_uni_loo))
+    results <- rbind(results, data.frame(SD = sd_val, Method = "UniLasso (LOO=FALSE)", MSE = mse_uni_no_loo))
+  }
+  setTxtProgressBar(pb, i)
+}
+close(pb)
+
+# ==========================================
+# 3. 可视化
+# ==========================================
+summary_df <- results %>% 
+  group_by(SD, Method) %>% 
+  summarise(Avg_MSE = mean(MSE), .groups = 'drop')
+
+ggplot(summary_df, aes(x = SD, y = Avg_MSE, color = Method, linetype = Method)) +
+  geom_line(size = 1.2) + geom_point(size = 3) +
+  scale_color_manual(values = c("#56B4E9", "red", "darkgreen")) +
+  scale_linetype_manual(values = c("solid", "dashed", "solid")) +
+  labs(title = "Is LOO the Culprit?",
+       subtitle = "Comparing UniLasso with and without Leave-One-Out pre-validation.",
+       x = "Standard Deviation of Features (Signal Strength)", 
+       y = "Test MSE") +
+  theme_minimal() +
+  theme(legend.position = "bottom", plot.title = element_text(face="bold"))
+```
+* 关闭LOO之后，竟然恢复了
+
+# 关闭LOO的验证实验
+
+```{r}
+library(MASS)
+library(glmnet)
+library(ggplot2)
+library(gridExtra)
+library(dplyr)
+
+# ==========================================
+# 1. 数据工厂 (High Variance)
+# ==========================================
+generate_high_var_data <- function(n, p = 100, sd_x = 5.0, sigma_noise = 1) {
+  # 生成高方差特征
+  X <- matrix(rnorm(n * p, mean = 0, sd = sd_x), n, p)
+  colnames(X) <- paste0("V", 1:p)
+  
+  # 真实系数: 前10个为2
+  beta_true <- rep(0, p)
+  beta_true[1:10] <- 2
+  true_support <- 1:10
+  
+  # Y 值会很大
+  Y <- X %*% beta_true + rnorm(n, 0, sigma_noise)
+  
+  return(list(X = X, Y = Y, true_support = true_support))
+}
+
+# ==========================================
+# 2. 指标计算器 (复用)
+# ==========================================
+calc_metrics <- function(coef_vec, true_support, p, y_true, y_pred) {
+  if(names(coef_vec)[1] == "(Intercept)") coef_vec <- coef_vec[-1]
+  active_idx <- which(coef_vec != 0)
+  
+  support_size <- length(active_idx)
+  tp <- length(intersect(active_idx, true_support))
+  sens <- tp / length(true_support)
+  
+  true_zeros <- setdiff(1:p, true_support)
+  pred_zeros <- setdiff(1:p, active_idx)
+  tn <- length(intersect(pred_zeros, true_zeros))
+  spec <- tn / length(true_zeros)
+  
+  mse <- mean((y_true - y_pred)^2)
+  
+  return(list(MSE = mse, Sensitivity = sens, Specificity = spec, 
+              SupportSize = support_size, SupportSet = active_idx))
+}
+
+calculate_pairwise_stability <- function(support_list) {
+  n_runs <- length(support_list)
+  pairs <- combn(n_runs, 2)
+  stability_scores <- apply(pairs, 2, function(idx) {
+    s1 <- support_list[[idx[1]]]
+    s2 <- support_list[[idx[2]]]
+    u <- length(union(s1, s2))
+    if(u == 0) 0 else length(intersect(s1, s2)) / u
+  })
+  return(stability_scores)
+}
+
+# ==========================================
+# 3. 批量实验主循环
+# ==========================================
+B <- 50
+n_train <- 50
+n_test <- 1000
+p <- 100
+sd_setting <- 30 # 高方差设置
+
+results_df <- data.frame()
+support_sets_uni <- list()
+support_sets_lasso <- list()
+
+cat("开始修复验证实验 (SD=5.0, LOO=FALSE)...\n")
+pb <- txtProgressBar(min = 0, max = B, style = 3)
+
+set.seed(2025)
+
+for (b in 1:B) {
+  # 1. 生成高方差数据
+  train <- generate_high_var_data(n_train, p, sd_x = sd_setting)
+  test <- generate_high_var_data(n_test, p, sd_x = sd_setting)
+  
+  # 2. UniLasso (关键修改: loo=FALSE, standardize=TRUE)
+  # 这将使 UniLasso 退化为类似 Adaptive Lasso 的模式
+  fit_uni <- cv.uniLasso(train$X, train$Y, family = "gaussian", 
+                         loo = FALSE, standardize = TRUE)
+  
+  coef_uni <- as.numeric(coef(fit_uni, s = "lambda.min"))
+  names(coef_uni) <- rownames(coef(fit_uni))
+  pred_uni <- predict(fit_uni, newx = test$X, s = "lambda.min")
+  
+  m_uni <- calc_metrics(coef_uni, train$true_support, p, test$Y, pred_uni)
+  support_sets_uni[[b]] <- m_uni$SupportSet
+  
+  # 3. Standard Lasso
+  fit_lasso <- cv.glmnet(train$X, train$Y, family = "gaussian", standardize = TRUE)
+  
+  coef_lasso <- as.numeric(coef(fit_lasso, s = "lambda.min"))
+  names(coef_lasso) <- rownames(coef(fit_lasso))
+  pred_lasso <- predict(fit_lasso, newx = test$X, s = "lambda.min")
+  
+  m_lasso <- calc_metrics(coef_lasso, train$true_support, p, test$Y, pred_lasso)
+  support_sets_lasso[[b]] <- m_lasso$SupportSet
+  
+  # 4. 收集
+  tmp_df <- data.frame(
+    Run = b,
+    Method = c("UniLasso (No LOO)", "Lasso"), # 改名以便区分
+    MSE = c(m_uni$MSE, m_lasso$MSE),
+    Sensitivity = c(m_uni$Sensitivity, m_lasso$Sensitivity),
+    Specificity = c(m_uni$Specificity, m_lasso$Specificity),
+    SupportSize = c(m_uni$SupportSize, m_lasso$SupportSize)
+  )
+  results_df <- rbind(results_df, tmp_df)
+  setTxtProgressBar(pb, b)
+}
+close(pb)
+
+# 稳定性
+stab_uni <- calculate_pairwise_stability(support_sets_uni)
+stab_lasso <- calculate_pairwise_stability(support_sets_lasso)
+stability_df <- data.frame(
+  Stability = c(stab_uni, stab_lasso),
+  Method = rep(c("UniLasso (No LOO)", "Lasso"), each = length(stab_uni))
+)
+
+# ==========================================
+# 4. 可视化
+# ==========================================
+my_theme <- theme_minimal() + 
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face="bold", size=10), axis.title.x=element_blank())
+colors_fill <- c("#009E73", "#56B4E9") # 使用绿色代表修复后的 UniLasso
+
+p_mse <- ggplot(results_df, aes(x=Method, y=MSE, fill=Method)) + geom_boxplot(alpha=0.7) + 
+  labs(title="Test MSE (Lower is Better)") + my_theme + scale_fill_manual(values=colors_fill)
+
+# 真实 Support Size = 10
+p_size <- ggplot(results_df, aes(x=Method, y=SupportSize, fill=Method)) + geom_boxplot(alpha=0.7) + 
+  geom_hline(yintercept=10, linetype="dashed", color="red") +
+  labs(title="Support Size (True=10)") + my_theme + scale_fill_manual(values=colors_fill)
+
+p_sens <- ggplot(results_df, aes(x=Method, y=Sensitivity, fill=Method)) + geom_boxplot(alpha=0.7) + 
+  labs(title="Sensitivity (TPR)") + my_theme + scale_fill_manual(values=colors_fill)
+
+p_spec <- ggplot(results_df, aes(x=Method, y=Specificity, fill=Method)) + geom_boxplot(alpha=0.7) + 
+  labs(title="Specificity (TNR)") + my_theme + scale_fill_manual(values=colors_fill)
+
+p_stab <- ggplot(stability_df, aes(x=Method, y=Stability, fill=Method)) + geom_boxplot(alpha=0.7) + 
+  labs(title="Stability (Jaccard Index)") + my_theme + scale_fill_manual(values=colors_fill)
+
+grid.arrange(p_mse, p_size, p_sens, p_spec, p_stab, 
+             ncol = 3, nrow = 2, 
+             top = paste("High Variance Data (SD=5.0): UniLasso (LOO=FALSE) vs Lasso"))
+
+# 数值汇总
+final_summary <- merge(aggregate(cbind(MSE, Sensitivity, Specificity, SupportSize) ~ Method, results_df, mean),
+                       aggregate(Stability ~ Method, stability_df, mean), by="Method")
+cat("\n=== 修复验证实验结果汇总 ===\n")
+print(final_summary)
+```
+* UniLasso和Lasso的表现一摸一样

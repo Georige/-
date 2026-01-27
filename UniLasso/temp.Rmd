@@ -1,0 +1,342 @@
+---
+title: "temp"
+output: html_document
+---
+
+```{r}
+library(MASS)
+library(glmnet)
+library(ggplot2)
+library(gridExtra)
+
+# ==========================================
+# 1. 高共线性数据工厂
+# ==========================================
+generate_collinear_data <- function(n, p=20, rho=0.95, sigma_noise=2) {
+  # 构造协方差矩阵：前两个变量高度相关
+  Sigma <- matrix(0, p, p)
+  diag(Sigma) <- 1
+  Sigma[1, 2] <- Sigma[2, 1] <- rho # X1, X2 高度正相关
+  
+  X <- mvrnorm(n, mu = rep(0, p), Sigma = Sigma)
+  colnames(X) <- paste0("V", 1:p)
+  
+  # 真实系数：两者都为正，且相等
+  beta_true <- rep(0, p)
+  beta_true[1:2] <- 3 
+  
+  # Y
+  Y <- X %*% beta_true + rnorm(n, 0, sigma_noise)
+  
+  return(list(X = X, Y = Y, beta_true = beta_true))
+}
+
+# ==========================================
+# 2. 实验：符号反转检测 (Sign Flip Detection)
+# ==========================================
+B <- 100
+n <- 100 # 样本量不大，容易出幺蛾子
+p <- 20
+
+# 存储 V1 和 V2 的系数
+res_lasso <- data.frame(V1 = numeric(B), V2 = numeric(B), Method = "Lasso")
+res_uni <- data.frame(V1 = numeric(B), V2 = numeric(B), Method = "UniLasso")
+
+cat("开始符号稳定性实验 (Rho=0.95)...\n")
+pb <- txtProgressBar(min=0, max=B, style=3)
+
+set.seed(2025)
+
+for(b in 1:B) {
+  d <- generate_collinear_data(n, p)
+  
+  # 1. Lasso
+  fit_lasso <- cv.glmnet(d$X, d$Y, family="gaussian")
+  coef_lasso <- as.numeric(coef(fit_lasso, s="lambda.min"))
+  res_lasso$V1[b] <- coef_lasso[2] # Index 2 corresponds to V1 (1 is Intercept)
+  res_lasso$V2[b] <- coef_lasso[3] # Index 3 corresponds to V2
+  
+  # 2. UniLasso (开启 loo=FALSE 以获得最纯粹的方向限制效果)
+  # 我们这里的目的是展示“方向约束”的价值
+  fit_uni <- cv.uniLasso(d$X, d$Y, family="gaussian", loo=FALSE, standardize=TRUE)
+  coef_uni <- as.numeric(coef(fit_uni, s="lambda.min"))
+  res_uni$V1[b] <- coef_uni[2]
+  res_uni$V2[b] <- coef_uni[3]
+  
+  setTxtProgressBar(pb, b)
+}
+close(pb)
+
+# 合并数据
+df_all <- rbind(res_lasso, res_uni)
+
+# ==========================================
+# 3. 统计“错误的符号” (Wrong Signs)
+# ==========================================
+# 真实系数都是 +3。任何负系数都是“物理意义错误”的。
+df_all$Has_Negative_Coeff <- (df_all$V1 < 0) | (df_all$V2 < 0)
+
+# 计算错误率
+error_rates <- aggregate(Has_Negative_Coeff ~ Method, df_all, mean)
+colnames(error_rates)[2] <- "Negative_Sign_Rate"
+
+cat("\n====== 符号错误率 (越低越好) ======\n")
+print(error_rates)
+
+# ==========================================
+# 4. 可视化：系数散点图
+# ==========================================
+# 我们画出 V1 vs V2 的系数分布。
+# 理想情况：应该集中在 (3, 3) 附近。
+# 糟糕情况：分布在第二、四象限 (一正一负)。
+
+p_scatter <- ggplot(df_all, aes(x = V1, y = V2, color = Method)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  # 标记真实值
+  annotate("point", x=3, y=3, color="red", size=5, shape=18) +
+  annotate("text", x=3.2, y=3.2, label="True Beta", color="red") +
+  labs(title = "Coefficient Stability: V1 vs V2",
+       subtitle = "True V1=3, V2=3. Points in top-right quadrant are valid.\nPoints in other quadrants imply Sign Flipping (Bad Interpretability).",
+       x = "Coefficient of V1", y = "Coefficient of V2") +
+  theme_minimal() +
+  scale_color_manual(values = c("#56B4E9", "#E69F00"))
+
+grid.arrange(p_scatter)
+```
+* 表现没有区别
+
+```{r}
+library(MASS)
+library(glmnet)
+library(ggplot2)
+library(gridExtra)
+library(dplyr)
+
+# ==========================================
+# 1. 高维稀疏数据工厂
+# ==========================================
+generate_sparse_noise_data <- function(n, p=500, sigma_noise=1) {
+  # 生成完全独立的特征矩阵 (最简单的场景，考验纯筛选能力)
+  X <- matrix(rnorm(n * p), n, p)
+  colnames(X) <- paste0("V", 1:p)
+  
+  # 真实系数：极度稀疏，只有前5个有值
+  beta_true <- rep(0, p)
+  beta_true[1:5] <- 1.5 # 信号强度适中
+  true_support <- 1:5
+  
+  Y <- X %*% beta_true + rnorm(n, 0, sigma_noise)
+  
+  return(list(X = X, Y = Y, true_support = true_support))
+}
+
+# ==========================================
+# 2. 噪音抑制实验
+# ==========================================
+B <- 50
+n <- 100
+p <- 500 # 维度远大于样本量
+
+results_df <- data.frame()
+
+cat("开始噪音抑制实验 (p=500, n=100, True=5)...\n")
+pb <- txtProgressBar(min=0, max=B, style=3)
+
+set.seed(2025)
+
+for(b in 1:B) {
+  d <- generate_sparse_noise_data(n, p)
+  
+  # 1. Lasso
+  fit_lasso <- cv.glmnet(d$X, d$Y, family="gaussian")
+  coef_lasso <- as.numeric(coef(fit_lasso, s="lambda.min"))[-1] # 去截距
+  
+  # 2. UniLasso (推荐配置: loo=TRUE 在这种纯噪音过滤场景下通常表现更好)
+  fit_uni <- cv.uniLasso(d$X, d$Y, family="gaussian")
+  coef_uni <- as.numeric(coef(fit_uni, s="lambda.min"))[-1]
+  
+  # 计算指标
+  # A. 选中的变量总数
+  n_selected_lasso <- sum(coef_lasso != 0)
+  n_selected_uni <- sum(coef_uni != 0)
+  
+  # B. 假阳性 (False Positives): 选中的变量里，索引 > 5 的个数
+  idx_lasso <- which(coef_lasso != 0)
+  idx_uni <- which(coef_uni != 0)
+  
+  fp_lasso <- sum(idx_lasso > 5)
+  fp_uni <- sum(idx_uni > 5)
+  
+  # C. 真阳性 (True Positives): 是否找全了前5个
+  tp_lasso <- sum(idx_lasso <= 5)
+  tp_uni <- sum(idx_uni <= 5)
+  
+  # 记录
+  results_df <- rbind(results_df, data.frame(Method="Lasso", Metric="Total Selected", Value=n_selected_lasso))
+  results_df <- rbind(results_df, data.frame(Method="UniLasso", Metric="Total Selected", Value=n_selected_uni))
+  
+  results_df <- rbind(results_df, data.frame(Method="Lasso", Metric="False Positives (Noise)", Value=fp_lasso))
+  results_df <- rbind(results_df, data.frame(Method="UniLasso", Metric="False Positives (Noise)", Value=fp_uni))
+  
+  results_df <- rbind(results_df, data.frame(Method="Lasso", Metric="True Positives (Signal)", Value=tp_lasso))
+  results_df <- rbind(results_df, data.frame(Method="UniLasso", Metric="True Positives (Signal)", Value=tp_uni))
+  
+  setTxtProgressBar(pb, b)
+}
+close(pb)
+
+# ==========================================
+# 3. 可视化
+# ==========================================
+my_theme <- theme_minimal() + 
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face="bold"))
+colors_fill <- c("#56B4E9", "#E69F00")
+
+# 图1: 总选择数 (Total Selected)
+p_total <- ggplot(subset(results_df, Metric=="Total Selected"), aes(x=Method, y=Value, fill=Method)) +
+  geom_boxplot(alpha=0.7) +
+  geom_hline(yintercept=5, linetype="dashed", color="red") +
+  labs(title="Model Sparsity: Total Variables Selected", subtitle="Closer to 5 (Red Line) is better", y="Count") +
+  my_theme + scale_fill_manual(values=colors_fill)
+
+# 图2: 假阳性 (False Positives) - 最核心的图
+p_fp <- ggplot(subset(results_df, Metric=="False Positives (Noise)"), aes(x=Method, y=Value, fill=Method)) +
+  geom_boxplot(alpha=0.7) +
+  labs(title="Noise Filtering: False Positives", subtitle="Lower is Better (Ideally 0)", y="Count of Noise Variables") +
+  my_theme + scale_fill_manual(values=colors_fill)
+
+# 图3: 真阳性 (True Positives) - 检查是否为了干净而丢失信号
+p_tp <- ggplot(subset(results_df, Metric=="True Positives (Signal)"), aes(x=Method, y=Value, fill=Method)) +
+  geom_boxplot(alpha=0.7) +
+  labs(title="Signal Retention: True Positives", subtitle="Higher is Better (Max 5)", y="Count of True Variables") +
+  my_theme + scale_fill_manual(values=colors_fill)
+
+grid.arrange(p_total, p_fp, p_tp, ncol=3, top="UniLasso vs Lasso: The 'Cleanliness' Test (p=500)")
+
+# 数值汇总
+cat("\n====== 实验均值汇总 ======\n")
+summary_stats <- aggregate(Value ~ Method + Metric, results_df, mean)
+print(summary_stats)
+```
+
+
+```{r}
+library(MASS)
+library(glmnet)
+library(ggplot2)
+library(gridExtra)
+library(dplyr)
+
+# ==========================================
+# 1. 非线性数据工厂
+# ==========================================
+generate_nonlinear_data <- function(n, p=200, sigma_noise=1) {
+  X <- matrix(rnorm(n * p), n, p)
+  colnames(X) <- paste0("V", 1:p)
+  
+  # 初始化 Y
+  Y_signal <- rep(0, n)
+  
+  # 1. Linear (V1): 完美的线性关系
+  # 这是送分题
+  Y_signal <- Y_signal + 2 * X[, 1]
+  
+  # 2. Pure Quadratic (V2): 纯二次方，对称分布
+  # 相关性陷阱：Cor(X, X^2) 在正态分布下为 0
+  # Lasso 和 UniLasso 理论上都看不到它
+  Y_signal <- Y_signal + 2 * (X[, 2]^2 - 1) # 减1是为了中心化
+  
+  # 3. Shifted Quadratic (V3): 移位二次方
+  # 展开：(X+2)^2 = X^2 + 4X + 4
+  # 包含一个强线性项 4X，所以模型应该能捕捉到
+  Y_signal <- Y_signal + 1 * (X[, 3] + 2)^2
+  
+  # 4. Exponential (V4): 指数关系
+  # 高度非线性，但单调递增，线性相关性很强
+  Y_signal <- Y_signal + 1 * exp(X[, 4])
+  
+  # 5. Interaction (V5, V6): 交互项
+  # 纯交互：V5 * V6。如果 V5, V6 独立，单看 V5 对 Y 没线性影响
+  Y_signal <- Y_signal + 3 * (X[, 5] * X[, 6])
+  
+  # 添加噪音
+  Y <- Y_signal + rnorm(n, 0, sigma_noise)
+  
+  # 记录真实的支持集 (前6个)
+  true_support <- 1:6
+  
+  return(list(X = X, Y = Y, true_support = true_support))
+}
+
+# ==========================================
+# 2. 捕获率测试 (Selection Probability)
+# ==========================================
+B <- 50
+n <- 100
+p <- 200
+
+# 记录每个变量被选中的次数
+selection_counts_uni <- numeric(p)
+selection_counts_lasso <- numeric(p)
+
+cat("开始非线性关系压力测试 (Linear, Quad, Exp, Interaction)...\n")
+pb <- txtProgressBar(min=0, max=B, style=3)
+
+set.seed(2025)
+
+for(b in 1:B) {
+  d <- generate_nonlinear_data(n, p)
+  
+  # 1. UniLasso
+  fit_uni <- cv.uniLasso(d$X, d$Y, family="gaussian")
+  coef_uni <- as.numeric(coef(fit_uni, s="lambda.min"))[-1]
+  # 累加被选中的变量 (转为 0/1)
+  selection_counts_uni <- selection_counts_uni + (coef_uni != 0)
+  
+  # 2. Lasso
+  fit_lasso <- cv.glmnet(d$X, d$Y, family="gaussian")
+  coef_lasso <- as.numeric(coef(fit_lasso, s="lambda.min"))[-1]
+  selection_counts_lasso <- selection_counts_lasso + (coef_lasso != 0)
+  
+  setTxtProgressBar(pb, b)
+}
+close(pb)
+
+# ==========================================
+# 3. 可视化：谁活下来了？
+# ==========================================
+# 我们只关心前 10 个变量 (6个信号 + 4个噪音代表)
+top_k <- 10
+prob_df <- data.frame(
+  Variable = paste0("V", 1:top_k),
+  Type = c("Linear", "Pure Quad", "Shift Quad", "Exp", "Inter 1", "Inter 2", 
+           "Noise", "Noise", "Noise", "Noise"),
+  UniLasso = selection_counts_uni[1:top_k] / B,
+  Lasso = selection_counts_lasso[1:top_k] / B
+)
+
+# 转换格式绘图
+df_melt <- melt(prob_df, id.vars = c("Variable", "Type"))
+
+ggplot(df_melt, aes(x = Variable, y = value, fill = variable)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.7) +
+  geom_text(aes(label = Type, y = -0.05), position = position_dodge(width = 0.7), 
+            angle = 90, hjust = 1, size = 3, color = "black") +
+  scale_y_continuous(limits = c(-0.2, 1.05), breaks = seq(0, 1, 0.2)) +
+  scale_fill_manual(values = c("#E69F00", "#56B4E9")) +
+  labs(title = "Non-linear Signal Capture Rate (50 Runs)",
+       subtitle = "Can linear models see non-linear patterns? (V1-V6 are True Signals)",
+       y = "Selection Probability",
+       x = "Variable (Type)",
+       fill = "Method") +
+  theme_minimal() +
+  theme(plot.title = element_text(face="bold"))
+
+
+```
+
+
+
+

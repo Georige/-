@@ -1,0 +1,233 @@
+---
+title: "UniLasso&Lasso"
+output: html_document
+---
+
+```{r}
+library(MASS)
+library(glmnet)
+library(ggplot2)
+library(gridExtra) # 用于组合多张图
+library(reshape2)  # 用于数据变形
+
+# ==========================================
+# 1. 基础配置与辅助函数
+# ==========================================
+
+# 数据生成器 (使用 AR(1) 结构, rho=0.5 增加难度)
+generate_data <- function(n, p, rho = 0.5, sigma_noise = 1) {
+  exponent_matrix <- abs(outer(1:p, 1:p, "-"))
+  Sigma <- rho^exponent_matrix
+  X <- mvrnorm(n = n, mu = rep(0, p), Sigma = Sigma)
+  
+  # 真实系数: 前5个为2，其余为0
+  beta_true <- rep(0, p)
+  beta_true[1:5] <- 2
+  true_support <- 1:5 # 真实支持集
+  
+  epsilon <- rnorm(n, mean = 0, sd = sigma_noise)
+  Y <- X %*% beta_true + epsilon
+  
+  return(list(X = X, Y = Y, beta_true = beta_true, true_support = true_support))
+}
+
+# 指标计算辅助函数
+calc_metrics <- function(coef_vec, true_support, p, y_true, y_pred) {
+  # 移除截距 (Intercept)
+  if(names(coef_vec)[1] == "(Intercept)") {
+    coef_vec <- coef_vec[-1] 
+  }
+  
+  # 提取非零系数的索引 (支持集)
+  active_idx <- which(coef_vec != 0)
+  
+  # 1. Support Size
+  support_size <- length(active_idx)
+  
+  # 2. Sensitivity (TPR) = TP / (TP + FN)
+  # TP: 选中的变量里，属于真实前5个的数量
+  tp <- length(intersect(active_idx, true_support))
+  sens <- tp / length(true_support)
+  
+  # 3. Specificity (TNR) = TN / (TN + FP)
+  # TN: 没选中的变量里，确实是0的数量
+  # 真实为0的集合
+  true_zeros <- setdiff(1:p, true_support)
+  # 预测为0的集合
+  pred_zeros <- setdiff(1:p, active_idx)
+  tn <- length(intersect(pred_zeros, true_zeros))
+  spec <- tn / length(true_zeros)
+  
+  # 4. MSE
+  mse <- mean((y_true - y_pred)^2)
+  
+  return(list(
+    MSE = mse,
+    Sensitivity = sens,
+    Specificity = spec,
+    SupportSize = support_size,
+    SupportSet = active_idx # 保存集合用于计算稳定性
+  ))
+}
+
+# ==========================================
+# 2. 批量实验主循环
+# ==========================================
+
+B <- 50             # 重复次数
+n_train <- 100
+n_test <- 1000
+p <- 300
+rho_val <- 0.5      # 设置相关性
+
+# 初始化存储容器
+results_df <- data.frame() # 存储标量指标 (MSE, Sens, Spec, Size)
+support_sets_uni <- list() # 存储 UniLasso 支持集
+support_sets_lasso <- list() # 存储 Lasso 支持集
+
+cat("开始批量实验 (共", B, "次)...\n")
+pb <- txtProgressBar(min = 0, max = B, style = 3)
+
+set.seed(2025)
+
+for (b in 1:B) {
+  # 1. 生成数据
+  train <- generate_data(n_train, p, rho = rho_val)
+  test <- generate_data(n_test, p, rho = rho_val)
+  
+  # 2. UniLasso
+  fit_uni <- cv.uniLasso(train$X, train$Y, family = "gaussian")
+  coef_uni <- as.numeric(coef(fit_uni, s = "lambda.min"))
+  names(coef_uni) <- rownames(coef(fit_uni)) # 保持名字以便处理截距
+  pred_uni <- predict(fit_uni, newx = test$X, s = "lambda.min")
+  
+  m_uni <- calc_metrics(coef_uni, train$true_support, p, test$Y, pred_uni)
+  support_sets_uni[[b]] <- m_uni$SupportSet
+  
+  # 3. Standard Lasso
+  fit_lasso <- cv.glmnet(train$X, train$Y, family = "gaussian")
+  coef_lasso <- as.numeric(coef(fit_lasso, s = "lambda.min"))
+  names(coef_lasso) <- rownames(coef(fit_lasso))
+  pred_lasso <- predict(fit_lasso, newx = test$X, s = "lambda.min")
+  
+  m_lasso <- calc_metrics(coef_lasso, train$true_support, p, test$Y, pred_lasso)
+  support_sets_lasso[[b]] <- m_lasso$SupportSet
+  
+  # 4. 收集标量数据
+  tmp_df <- data.frame(
+    Run = b,
+    Method = c("UniLasso", "Lasso"),
+    MSE = c(m_uni$MSE, m_lasso$MSE),
+    Sensitivity = c(m_uni$Sensitivity, m_lasso$Sensitivity),
+    Specificity = c(m_uni$Specificity, m_lasso$Specificity),
+    SupportSize = c(m_uni$SupportSize, m_lasso$SupportSize)
+  )
+  results_df <- rbind(results_df, tmp_df)
+  
+  setTxtProgressBar(pb, b)
+}
+close(pb)
+cat("\n实验完成，正在计算稳定性...\n")
+
+# ==========================================
+# 3. 计算稳定性 (Pairwise Jaccard Index)
+# ==========================================
+
+calculate_pairwise_stability <- function(support_list) {
+  n_runs <- length(support_list)
+  # 生成所有两两组合 C(50, 2)
+  pairs <- combn(n_runs, 2)
+  n_pairs <- ncol(pairs)
+  
+  stability_scores <- numeric(n_pairs)
+  
+  for(i in 1:n_pairs) {
+    idx1 <- pairs[1, i]
+    idx2 <- pairs[2, i]
+    
+    set1 <- support_list[[idx1]]
+    set2 <- support_list[[idx2]]
+    
+    # Jaccard Index = Intersection / Union
+    intersect_len <- length(intersect(set1, set2))
+    union_len <- length(union(set1, set2))
+    
+    if(union_len == 0) {
+      stability_scores[i] <- 0 # 防止除以0，虽不太可能发生
+    } else {
+      stability_scores[i] <- intersect_len / union_len
+    }
+  }
+  return(stability_scores)
+}
+
+stab_uni <- calculate_pairwise_stability(support_sets_uni)
+stab_lasso <- calculate_pairwise_stability(support_sets_lasso)
+
+# 构建稳定性的数据框
+stability_df <- data.frame(
+  Stability = c(stab_uni, stab_lasso),
+  Method = rep(c("UniLasso", "Lasso"), each = length(stab_uni))
+)
+
+# ==========================================
+# 4. 可视化 (Boxplots)
+# ==========================================
+
+# 定义绘图主题
+my_theme <- theme_minimal() + 
+  theme(legend.position = "none", 
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        axis.title.x = element_blank())
+
+# 图 1: MSE
+p_mse <- ggplot(results_df, aes(x = Method, y = MSE, fill = Method)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Test MSE", y = "Mean Squared Error") +
+  my_theme + scale_fill_manual(values = c("#E69F00", "#56B4E9"))
+
+# 图 2: Support Size
+p_size <- ggplot(results_df, aes(x = Method, y = SupportSize, fill = Method)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_hline(yintercept = 5, linetype = "dashed", color = "red") + # 真实非零个数
+  labs(title = "Support Set Size", y = "Count (True = 5)") +
+  my_theme + scale_fill_manual(values = c("#E69F00", "#56B4E9"))
+
+# 图 3: Sensitivity
+p_sens <- ggplot(results_df, aes(x = Method, y = Sensitivity, fill = Method)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Sensitivity (TPR)", y = "Rate") +
+  my_theme + scale_fill_manual(values = c("#E69F00", "#56B4E9"))
+
+# 图 4: Specificity
+p_spec <- ggplot(results_df, aes(x = Method, y = Specificity, fill = Method)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Specificity (TNR)", y = "Rate") +
+  my_theme + scale_fill_manual(values = c("#E69F00", "#56B4E9"))
+
+# 图 5: Stability (新加入的)
+p_stab <- ggplot(stability_df, aes(x = Method, y = Stability, fill = Method)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(title = "Model Stability", y = "Jaccard Index (Intersection/Union)") +
+  my_theme + scale_fill_manual(values = c("#E69F00", "#56B4E9"))
+
+# 组合绘图
+grid.arrange(p_mse, p_size, p_sens, p_spec, p_stab, 
+             ncol = 3, nrow = 2, 
+             top = "Comparison of UniLasso vs Lasso (50 Replications)")
+
+# ==========================================
+# 5. 输出数值摘要表格
+# ==========================================
+
+summary_stats <- aggregate(cbind(MSE, Sensitivity, Specificity, SupportSize) ~ Method, 
+                           data = results_df, mean)
+summary_stab <- aggregate(Stability ~ Method, data = stability_df, mean)
+
+final_summary <- merge(summary_stats, summary_stab, by = "Method")
+cat("\n=== 实验指标均值汇总 ===\n")
+print(final_summary)
+```
+
+
+

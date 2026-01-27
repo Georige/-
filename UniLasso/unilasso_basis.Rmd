@@ -1,0 +1,142 @@
+---
+title: "unilasso_basis"
+output: html_document
+---
+
+
+```{r}
+library(uniLasso)
+# 加载依赖库
+library(MASS)    # 用于生成多元正态分布数据 (mvrnorm)
+library(glmnet)  # uniLasso 的底层依赖
+# library(uniLasso) # 如果你已安装该包，请取消注释
+# 如果未安装，请确保先 source() 你上传的所有 .R 文件，特别是 cv.uniLasso.R, uniInfo.R, uniCoef.R
+```
+
+
+
+```{r}
+generate_data <- function(n, p, rho = 0, sigma_noise = 1) {
+  # 1. 设置协方差矩阵 Sigma (这是你的“旋钮”)
+  # 目前 rho = 0，即单位矩阵。如果 rho > 0，则引入相关性
+  Sigma <- matrix(0, p, p)
+  
+
+  exponent_matrix <- -abs(outer(1:p, 1:p, "-"))
+  
+  Sigma <- rho^exponent_matrix
+  # 2. 生成特征矩阵 X (来自多元正态分布)
+  # mu = 0
+  X <- mvrnorm(n = n, mu = rep(10, p), Sigma = Sigma)
+  
+  # 3. 生成真实的系数 Beta
+  # 只有前5个变量有系数 2，其余为 0
+  beta_true <- rep(0, p)
+  beta_true[1:5] <- 2
+  
+  # 4. 生成响应变量 Y = X * beta + noise
+  noise <- rnorm(n, mean = 0, sd = sigma_noise)
+  Y <- X %*% beta_true + noise
+  
+  return(list(X = X, Y = Y, beta_true = beta_true))
+}
+
+# --- 执行生成 ---
+set.seed(2026) # 保证结果可复现
+
+# 训练集: 100 行, 300 列
+train_data <- generate_data(n = 100, p = 300,rho = 2)
+X_train <- train_data$X
+Y_train <- train_data$Y
+
+# 测试集: 1000 行, 300 列 (使用相同的分布)
+test_data <- generate_data(n = 1000, p = 300,rho = 2)
+X_test <- test_data$X
+Y_test <- test_data$Y
+
+cat("数据生成完毕。\n训练集维度:", dim(X_train), "\n测试集维度:", dim(X_test), "\n")
+
+```
+
+
+```{r}
+cat("\n====== 开始实验 1: UniLasso ======\n")
+
+# 1. 训练模型 (使用交叉验证选择最佳 Lambda)
+# loo=TRUE (默认) 表示使用 Leave-One-Out 近似来防止一元阶段过拟合
+fit_uni <- cv.uniLasso(X_train, Y_train, family = "gaussian")
+
+# 2. 得到最优模型的系数向量
+# s = "lambda.min" 表示选择 CV 误差最小的那个 lambda
+coef_uni_sparse <- coef(fit_uni, s = "lambda.min")
+
+# 3. 生成对比表格 (核心步骤)
+# 使用包内提供的 uniCoef 函数，它完美符合你的需求
+# 它会返回：一元系数 | UniLasso系数 | 是否变号
+comparison_table_uni <- uniCoef(fit_uni, s = "lambda.min")
+
+# 你的需求：第三列是一个布尔判断。
+# uniCoef 默认返回 "flip" 或 " "。我们需要将其转换为布尔值。
+comparison_table_uni$Is_Flip <- comparison_table_uni$`Sign?` == "flip"
+
+print("UniLasso 系数对比表 (部分展示):")
+print(head(comparison_table_uni))
+
+# 4. 得到最优模型支持集 (Support Set)
+# 即系数不为 0 的变量索引
+support_set_uni <- rownames(comparison_table_uni)
+cat("\nUniLasso 支持集 (变量名):", paste(support_set_uni, collapse = ", "), "\n")
+
+# 5. 测试集预测与 MSE 计算
+pred_uni <- predict(fit_uni, newx = X_test, s = "lambda.min")
+mse_uni <- mean((Y_test - pred_uni)^2)
+
+cat("UniLasso 测试集 MSE:", mse_uni, "\n")
+```
+
+```{r}
+cat("\n====== 开始实验 2: Standard Lasso ======\n")
+
+# 1. 训练模型 (标准 Lasso)
+fit_lasso <- cv.glmnet(X_train, Y_train, family = "gaussian")
+
+# 2. 得到最优系数
+coef_lasso_sparse <- coef(fit_lasso, s = "lambda.min")
+
+# 3. 生成对比表格
+# 注意：这里我们传入 fit_lasso，但是把 fit_uni$info 传进去作为参考
+# 这样我们就能对比 Lasso 系数 和 之前的一元系数
+comparison_table_lasso <- uniCoef(fit_lasso, info = fit_uni$info, s = "lambda.min")
+
+# 转换符号翻转列为布尔值
+comparison_table_lasso$Is_Flip <- comparison_table_lasso$`Sign?` == "flip"
+
+print("Lasso 系数对比表 (部分展示):")
+print(comparison_table_lasso)
+
+# 4. 得到支持集
+support_set_lasso <- rownames(comparison_table_lasso)
+cat("\nLasso 支持集 (变量名):", paste(support_set_lasso, collapse = ", "), "\n")
+
+# 5. 测试集预测与 MSE 计算
+pred_lasso <- predict(fit_lasso, newx = X_test, s = "lambda.min")
+mse_lasso <- mean((Y_test - pred_lasso)^2)
+
+cat("Lasso 测试集 MSE:", mse_lasso, "\n")
+```
+
+
+```{r}
+p = 10
+Sigma <- matrix(0, p, p)
+rho = 2
+exponent_matrix <- -abs(outer(1:p, 1:p, "-"))
+exponent_matrix
+Sigma <- rho^exponent_matrix
+Sigma
+```
+
+
+
+
+

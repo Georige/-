@@ -1,0 +1,6 @@
+---
+title: "different collaboration"
+output: html_document
+---
+
+这个文件旨在探究在特征之间具有不同的相关性不只是AR（1）时UniLasso的表现如何
