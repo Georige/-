@@ -1,6 +1,9 @@
+# 文件名: randomized_svd.py
+
 import numpy as np
+import torch
 import time
-from typing import Tuple, Union, List
+from typing import Tuple, Union
 
 # --- 模块化导入 ---
 try:
@@ -9,136 +12,154 @@ except ImportError:
     print("错误: 找不到 core_utils.py。请确保上一段代码已保存为该文件名。")
     exit(1)
 
-def randomized_svd(
-    data: np.ndarray, 
+def _randomized_svd_2d_padded(
+    A: np.ndarray, 
     epsilon: float
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    实现算法 5.1: 直接随机化 SVD (支持 2D 矩阵和 3D 张量)。
+    内部函数：执行自适应 SVD，然后将结果强制填充(Padding)到原始维度。
+    """
+    m, n = A.shape
+    min_dim = min(m, n) # 对于 64x64，这就是 64
     
-    如果是 3D 张量 (C, H, W)，会自动展平为 (C*H, W) 进行计算，
-    并在返回时尝试还原 U 的维度。
+    # 1. 自适应计算 (得到的 k 可能远小于 64)
+    Q = adaptive_randomized_range_finder(A, epsilon=epsilon)
+    B = Q.T @ A
+    S_hat, Sigma_small, Vt_small = np.linalg.svd(B, full_matrices=False)
+    U_small = Q @ S_hat
     
-    参数:
-        data (np.ndarray): 输入数据，形状可以是 (m, n) 或 (c, h, w)。
-        epsilon (float): 容差阈值。
+    # 获取当前的有效秩 k
+    k = Sigma_small.shape[0]
+    
+    # 如果算法发现 k >= min_dim，说明不需要补全，或者容差设置得太小
+    if k >= min_dim:
+        # 为了安全，截断到 min_dim
+        return U_small[:, :min_dim], Sigma_small[:min_dim], Vt_small[:min_dim, :]
+    
+    # 2. 执行零填充 (Zero Padding)
+    # 目标: S变成 (min_dim,), U变成 (m, min_dim), Vt变成 (min_dim, n)
+    
+    # --- 补全 S ---
+    Sigma_final = np.zeros(min_dim, dtype=A.dtype)
+    Sigma_final[:k] = Sigma_small # 前 k 个填入真实值，后面全是 0
+    
+    # --- 补全 U ---
+    # U 的形状通常是 (m, k)，我们需要把它变成 (m, min_dim)
+    # 我们在右边增加 (min_dim - k) 列的 0
+    U_final = np.zeros((m, min_dim), dtype=A.dtype)
+    U_final[:, :k] = U_small
+    
+    # --- 补全 Vt ---
+    # Vt 的形状通常是 (k, n)，我们需要把它变成 (min_dim, n)
+    # 我们在下边增加 (min_dim - k) 行的 0
+    Vt_final = np.zeros((min_dim, n), dtype=A.dtype)
+    Vt_final[:k, :] = Vt_small
+    
+    return U_final, Sigma_final, Vt_final
+
+def randomized_svd(
+    data: Union[np.ndarray, torch.Tensor], 
+    epsilon: float = 1e-2
+) -> Tuple[Union[np.ndarray, torch.Tensor], ...]:
+    """
+    实现算法 5.1: 带有自动零填充(Zero-Padding)的随机化 SVD。
+    
+    功能:
+    不管输入矩阵的真实秩是多少，输出的维度总是固定的 (Economy SVD 维度)。
+    缺失的秩对应的奇异值设为 0，对应的向量设为 0。
+    
+    输入:
+        data: (C, H, W) 或 (H, W)。例如 (3, 64, 64)。
+        epsilon: 容差。
         
-    返回:
-        U (np.ndarray): 左奇异向量。
-        S (np.ndarray): 奇异值。
-        Vt (np.ndarray): 右奇异向量。
+    输出 (假设输入 3, 64, 64):
+        U:  (3, 64, 64)
+        S:  (3, 64)      <-- 即使秩只有10，这里长度也是64，后54个为0
+        Vh: (3, 64, 64)
     """
     
-    # --- 阶段 0: 数据预处理 (张量适配) ---
-    original_shape = data.shape
-    is_3d = False
-    
-    if len(original_shape) == 3:
-        # 处理 3D 张量: (Channels, Height, Width) -> (3, 64, 64)
-        print(f"检测到 3D 输入 {original_shape}，正在执行模式转换 (Unfolding)...")
-        is_3d = True
-        c, h, w = original_shape
-        
-        # 策略: 将 (C, H, W) 展平为 (C*H, W)
-        # 也就是把每个通道的每一行都堆叠起来，形成一个“高瘦”的矩阵
-        # 形状变为 (192, 64)
-        A = data.reshape(c * h, w)
-        print(f"  >> 转换后矩阵形状: {A.shape}")
-    elif len(original_shape) == 2:
-        # 标准 2D 矩阵
-        A = data
+    # 1. 转换转 NumPy
+    is_torch = False
+    if isinstance(data, torch.Tensor):
+        is_torch = True
+        device = data.device
+        dtype = data.dtype
+        A_numpy = data.detach().cpu().numpy()
     else:
-        raise ValueError(f"不支持的维度: {original_shape}。仅支持 2D 或 3D 输入。")
+        A_numpy = data
 
-    print("--- 第一阶段: 计算正交基 Q (Range Finder) ---")
-    start_time = time.time()
+    input_shape = A_numpy.shape
     
-    # 1. 计算 Q
-    Q = adaptive_randomized_range_finder(A, epsilon=epsilon)
-    
-    k = Q.shape[1]
-    print(f"  >> 找到的秩 k = {k}")
-    print(f"  >> Range Finder 耗时: {time.time() - start_time:.4f}s")
-    
-    print("--- 第二阶段: 降维与小矩阵分解 ---")
-    # 2. 形成小矩阵 B = Q.T @ A
-    B = Q.T @ A
-    
-    # 3. 对小矩阵 B 进行标准 SVD (Economy mode)
-    # S_hat: (k, k), Sigma: (k,), Vt: (k, n)
-    S_hat, Sigma, Vt = np.linalg.svd(B, full_matrices=False)
-    
-    print("--- 第三阶段: 还原高维空间 ---")
-    # 4. 计算最终的 U = Q @ S_hat
-    # U 的形状目前是 (m, k)，即 (C*H, k)
-    U = Q @ S_hat
-    
-    # --- 阶段 4: 结果后处理 (维度还原) ---
-    if is_3d:
-        # 如果输入是 (C, H, W)，我们将 U 从 (C*H, k) 还原为 (C, H, k)
-        # 这样你可以保留空间结构信息
-        # 注意: Vt 通常保持 (k, W)，代表特征在宽度维度的分布
-        try:
-            c, h, w = original_shape
-            U_reshaped = U.reshape(c, h, k)
-            print(f"  >> 已将 U 还原为 3D 结构: {U_reshaped.shape}")
-            return U_reshaped, Sigma, Vt
-        except Exception as e:
-            print(f"  >> 警告: U 维度还原失败 ({e})，返回 2D 形式。")
-            return U, Sigma, Vt
+    # 2. 逐通道处理
+    if len(input_shape) == 3:
+        C, H, W = input_shape
+        min_dim = min(H, W)
+        
+        # 预分配最终结果的内存 (直接按最大尺寸分配)
+        U_batch = np.zeros((C, H, min_dim), dtype=A_numpy.dtype)
+        S_batch = np.zeros((C, min_dim),    dtype=A_numpy.dtype)
+        Vt_batch = np.zeros((C, min_dim, W), dtype=A_numpy.dtype)
+        
+        for i in range(C):
+            # 处理单个通道
+            u, s, vt = _randomized_svd_2d_padded(A_numpy[i], epsilon)
             
-    return U, Sigma, Vt
-
-# --- 系统集成测试 (针对 3D 图片数据) ---
-if __name__ == "__main__":
-    np.random.seed(42)
-    
-    # 1. 模拟一张 (3, 64, 64) 的图片
-    # 我们故意制造一些低秩结构：背景(平滑) + 前景(物体)
-    channels, height, width = 3, 64, 64
-    print(f"\n正在生成模拟图片数据 ({channels}, {height}, {width})...")
-    
-    # 创建基础模式
-    base_pattern = np.zeros((height, width))
-    for i in range(height):
-        base_pattern[i, :] = np.sin(i / 5.0)  # 简单的波纹
+            # 填入 Batch 容器
+            # 由于 _randomized_svd_2d_padded 保证返回固定维度，这里直接赋值即可
+            U_batch[i] = u
+            S_batch[i] = s
+            Vt_batch[i] = vt
+            
+    elif len(input_shape) == 2:
+        U_batch, S_batch, Vt_batch = _randomized_svd_2d_padded(A_numpy, epsilon)
         
-    img_tensor = np.zeros((channels, height, width))
-    for c in range(channels):
-        # 每个通道有些许偏移
-        img_tensor[c, :, :] = base_pattern * (c + 1) + np.random.normal(0, 0.1, (height, width))
-        
-    # 2. 执行随机化 SVD
-    target_eps = 0.5 # 对于图片，容差可以稍微大一点
-    print("\n开始执行 Randomized SVD...")
-    
-    # 这一步会自动处理 reshape
-    U_approx, S_approx, Vt_approx = randomized_svd(img_tensor, epsilon=target_eps)
-    
-    # 3. 验证结果形状
-    print(f"\n结果分析:")
-    print(f"  >> U shape: {U_approx.shape} (预期: 3, 64, k)")
-    print(f"  >> S shape: {S_approx.shape} (预期: k)")
-    print(f"  >> Vt shape: {Vt_approx.shape} (预期: k, 64)")
-    
-    # 4. 尝试重建图片验证精度
-    # 重建公式: A ≈ U * S * Vt
-    # 需要注意维度的对齐: 
-    # U(3, 64, k) dot diag(S) dot Vt(k, 64)
-    # 为了计算方便，先把 U 变回 2D: (192, k)
-    k = len(S_approx)
-    U_2d = U_approx.reshape(channels * height, k)
-    
-    # 重建 2D 矩阵
-    img_reconstructed_2d = U_2d @ np.diag(S_approx) @ Vt_approx
-    
-    # 变回 3D
-    img_reconstructed = img_reconstructed_2d.reshape(channels, height, width)
-    
-    error = np.linalg.norm(img_tensor - img_reconstructed)
-    print(f"  >> 重建误差 (Frobenius Norm): {error:.4f}")
-    
-    if error < 10.0: # 图片数据的数值通常较大，误差绝对值会比之前大
-        print("\n✅ 3D Tensor 测试通过。")
     else:
-        print("\n⚠️ 误差较大，请检查参数。")
+        raise ValueError("仅支持 2D 或 3D 输入")
+
+    # 3. 转回 Torch
+    if is_torch:
+        U_out = torch.from_numpy(U_batch).to(dtype=dtype, device=device)
+        S_out = torch.from_numpy(S_batch).to(dtype=dtype, device=device)
+        Vt_out = torch.from_numpy(Vt_batch).to(dtype=dtype, device=device)
+        return U_out, S_out, Vt_out
+    else:
+        return U_batch, S_batch, Vt_batch
+
+# --- 验证代码 ---
+if __name__ == "__main__":
+    torch.manual_seed(42)
+    
+    # 1. 构造一个低秩的输入 (3, 64, 64)
+    # 我们故意让它的真实秩只有 10
+    rank = 10
+    U_true = torch.randn(3, 64, rank)
+    S_true = torch.randn(3, rank)
+    V_true = torch.randn(3, rank, 64)
+    z_t = U_true @ torch.diag_embed(S_true) @ V_true
+    
+    print(f"输入张量形状: {z_t.shape}")
+    print(f"真实设计的秩: {rank} (远小于 64)")
+    
+    # 2. 运行修改后的算法
+    # 注意：epsilon 不要太小，否则它可能会试图去拟合噪声，算出一个很大的 k
+    U_pad, S_pad, Vh_pad = randomized_svd(z_t, epsilon=1e-2)
+    
+    # 3. 验证维度 (必须是 64!)
+    print("\n--- 维度检查 (期望全为 64) ---")
+    print(f"U shape : {U_pad.shape}  -> {U_pad.shape == (3, 64, 64)}")
+    print(f"S shape : {S_pad.shape}   -> {S_pad.shape == (3, 64)}")
+    print(f"Vh shape: {Vh_pad.shape}  -> {Vh_pad.shape == (3, 64, 64)}")
+    
+    # 4. 验证补零效果
+    print("\n--- 补零检查 ---")
+    # 检查第 0 个通道，第 20 个奇异值 (应该远大于 rank=10，所以必须是 0)
+    print(f"S[0, 20] (应为 0): {S_pad[0, 20]:.5f}")
+    print(f"S[0, -1] (应为 0): {S_pad[0, -1]:.5f}")
+    
+    # 5. 验证重建精度
+    recon = U_pad @ torch.diag_embed(S_pad) @ Vh_pad
+    err = torch.norm(z_t - recon)
+    print(f"\n重建误差: {err.item():.4f}")
+    
+    if S_pad.shape[1] == 64 and S_pad[0, -1] == 0:
+        print("\n✅ 测试通过：维度符合 PyTorch 标准，且低秩部分已补零。")
