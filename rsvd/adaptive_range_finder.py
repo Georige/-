@@ -1,120 +1,163 @@
 import numpy as np
+import torch
+from typing import Union, List
 
-def adaptive_randomized_range_finder(A: np.ndarray, epsilon: float, r: int = 10) -> np.ndarray:
+def adaptive_randomized_range_finder(
+    A: Union[np.ndarray, torch.Tensor], 
+    epsilon: float, 
+    r: int = 10
+) -> Union[np.ndarray, torch.Tensor]:
     """
-    实现算法 4.2: 自适应随机化 Range Finder。
+    实现算法 4.2: 自适应随机化 Range Finder (PyTorch/NumPy 通用版)。
     
     该函数计算矩阵 A 的正交基 Q，使得近似误差在概率上小于 epsilon。
-    
-    参数:
-        A (np.ndarray): 输入矩阵，形状为 (m, n)。
-        epsilon (float): 容差阈值。
-        r (int): 块大小/过采样参数，默认为 10。
-        
-    返回:
-        Q (np.ndarray): 正交矩阵，形状为 (m, k)，k 是自适应确定的秩。
+    自动适配 CPU(NumPy) 或 GPU(PyTorch)。
     """
     
-    # 获取矩阵维度 m (行数) x n (列数)
-    m, n = A.shape
+    # --- 1. 环境检测与适配 ---
+    is_torch = False
+    device = None
+    dtype = None
     
+    if isinstance(A, torch.Tensor):
+        is_torch = True
+        device = A.device
+        dtype = A.dtype
+        # 获取维度
+        m, n = A.shape
+    else:
+        # NumPy 模式
+        m, n = A.shape
+        dtype = A.dtype
+
+    # --- 2. 辅助函数 (屏蔽框架差异) ---
+    def make_random(shape):
+        if is_torch:
+            return torch.randn(shape, device=device, dtype=dtype)
+        else:
+            return np.random.normal(size=shape).astype(dtype)
+            
+    def calc_norm(vec):
+        if is_torch:
+            return torch.norm(vec)
+        else:
+            return np.linalg.norm(vec)
+            
+    def calc_dot(v1, v2):
+        if is_torch:
+            return torch.dot(v1, v2)
+        else:
+            return np.dot(v1, v2)
+            
+    def mat_mul_vec(mat, vec):
+        # 矩阵乘向量
+        return mat @ vec
+
     # --- 步骤 1: 初始化 ---
-    # Draw standard Gaussian vectors (生成 r 个标准高斯随机向量)
-    # 形状为 (n, r)
-    Omega = np.random.normal(size=(n, r))
+    # Draw standard Gaussian vectors omega^(1)...omega^(r)
+    Omega = make_random((n, r))
     
     # --- 步骤 2: 初始采样 ---
     # Compute Y = A * Omega
-    # 此时 Y 是一个包含 r 个向量的列表，每个向量形状为 (m,)
-    # 注意：为了方便后续动态添加，我们使用 Python List 存储向量，而不是固定矩阵
-    Y = [A @ Omega[:, i] for i in range(r)]
+    # 注意：为了保持动态特性，我们用列表存储向量
+    Y = []
+    for i in range(r):
+        # 取出第 i 列
+        omega_col = Omega[:, i]
+        y_col = mat_mul_vec(A, omega_col)
+        Y.append(y_col)
     
     # --- 步骤 3 & 4: 初始化循环变量 ---
     j = 0
-    Q = []  # Q 初始为空列表，后续会将基向量 append 进去
+    Q = []  # 存放正交基向量
     
     # 计算阈值 limit
-    # 公式: epsilon / (10 * sqrt(2/pi))
     # np.sqrt(2 / np.pi) 约等于 0.798
-    limit = epsilon / (10 * np.sqrt(2 / np.pi))
+    const_factor = 0.79788456
+    limit = epsilon / (10 * const_factor)
     
-    # --- 步骤 5: While 循环条件 ---
-    # 检查当前窗口内 r 个向量的最大范数是否超过阈值
-    # Y[j : j+r] 对应算法中的 y^(j+1)...y^(j+r)
+    # --- 步骤 5: While 循环 ---
+    # 只要前瞻窗口内的向量能量还很大，就继续寻找
     while True:
-        # 获取当前窗口内的向量
+        # 检查是否越界 (防止极其罕见的无限循环)
+        if j >= n: 
+            break
+            
+        # 获取当前窗口内的向量 Y[j : j+r]
+        # 如果窗口超出了 Y 的当前长度，说明需要生成新的 (虽然后面的逻辑会生成，但这里做个防守)
         current_window = Y[j : j+r]
+        if not current_window:
+            break
+            
+        # 计算窗口内每个向量的范数
+        norms = [calc_norm(y).item() for y in current_window] # .item() 转为 python float 比较
+        max_norm = max(norms)
         
-        # 计算窗口内每个向量的 L2 范数
-        norms = [np.linalg.norm(y) for y in current_window]
-        max_norm = np.max(norms)
-        
-        # 如果最大范数小于阈值，说明剩余的能量已经很小了，停止循环
+        # 停止条件
         if max_norm <= limit:
             break
             
-        # --- 步骤 6: 索引递增 ---
-        # 算法中 j = j + 1。在 Python 0-indexed 语境下，
-        # 我们当前处理的向量索引就是 j。
-        
-        # --- 步骤 7: 投影 (覆盖 y^(j)) ---
-        # 这一步在理论上是 (I - Q Q*)y。
-        # 但在算法步骤 13 中我们已经对后续向量做过正交化了。
-        # 为了数值稳定性，我们在这里再次确保 y_j 与之前的 Q 正交（可选，但推荐）
+        # --- 步骤 7: 投影 (Gram-Schmidt) ---
+        # 这里的 Y[j] 实际上已经被之前的 Q 正交化过了(在步骤13)，
+        # 但为了数值稳定性，或者如果是第一轮，我们需要确保它正交。
         y_current = Y[j]
-        for q_prev in Q:
-            y_current = y_current - q_prev * np.dot(q_prev, y_current)
+        
+        # Double Orthogonalization (数值稳定性关键)
+        for _ in range(2): # 做两次以防万一，通常一次也够
+            for q_prev in Q:
+                projection = calc_dot(q_prev, y_current)
+                y_current = y_current - q_prev * projection
         
         # --- 步骤 8: 归一化 ---
-        # q^(j) = y^(j) / ||y^(j)||
-        norm_y = np.linalg.norm(y_current)
+        norm_y = calc_norm(y_current)
         
-        # 防止除以零（极罕见情况，作为系统防御性编程）
         if norm_y < 1e-15:
-            # 如果向量范数极小，说明已经没有新信息，可以跳过或中断
-            break
+            # 线性相关，跳过
+            j += 1
+            continue
             
         q_new = y_current / norm_y
-        
-        # --- 步骤 9: 更新 Q ---
         Q.append(q_new)
         
         # --- 步骤 10: 生成新的高斯向量 ---
-        # Draw standard Gaussian vector of length n
-        omega_new = np.random.normal(size=n)
+        omega_new = make_random((n,))
         
-        # --- 步骤 11: 计算新样本并投影 ---
-        # y^(j+r) = (I - Q Q*) A omega_new
-        # 先计算 A * omega
-        y_new = A @ omega_new
+        # --- 步骤 11: 计算新样本 ---
+        # y_new = (I - Q Q*) A omega_new
+        # 先算 A * omega
+        y_new = mat_mul_vec(A, omega_new)
         
-        # 立即对现有的 Q 进行正交化投影
-        # y_new = y_new - sum(q * <q, y_new>)
+        # 立即对现有的 Q 进行正交化
         for q in Q:
-            y_new = y_new - q * np.dot(q, y_new)
+            y_new = y_new - q * calc_dot(q, y_new)
             
-        # 将新样本加入列表 Y
         Y.append(y_new)
         
-        # --- 步骤 12 & 13: 更新前瞻窗口内的向量 (Re-orthogonalization) ---
-        # 对当前窗口内剩余的 r-1 个向量，减去它们在 q_new 上的投影
-        # for i = (j+1) to (j+r-1)
-        for i in range(j + 1, j + r):
-            # Overwrite y^(i) by y^(i) - q^(j) <q^(j), y^(i)>
-            # 这是一个典型的 Gram-Schmidt 步骤
-            Y[i] = Y[i] - q_new * np.dot(q_new, Y[i])
+        # --- 步骤 12 & 13: 更新前瞻窗口内的向量 ---
+        # Y[i] = Y[i] - q_new * <q_new, Y[i]>
+        # 范围: j+1 到 j+r (注意 Python切片是左闭右开，但这里不仅是切片，是由于 append 导致 len 增加)
+        # 我们只需要更新目前列表中位于 j 之后的所有向量
+        for i in range(j + 1, len(Y)):
+            proj = calc_dot(q_new, Y[i])
+            Y[i] = Y[i] - q_new * proj
             
-        # 准备下一次迭代
         j += 1
 
     # --- 步骤 16: 构建最终矩阵 ---
-    # 将向量列表转换为矩阵 (m, k)
     if not Q:
-        return np.zeros((m, 0))
+        # 返回空矩阵
+        if is_torch:
+            return torch.zeros((m, 0), device=device, dtype=dtype)
+        else:
+            return np.zeros((m, 0), dtype=dtype)
     
-    Q_matrix = np.column_stack(Q)
+    # 堆叠结果
+    if is_torch:
+        Q_matrix = torch.stack(Q, dim=1)
+    else:
+        Q_matrix = np.column_stack(Q)
+        
     return Q_matrix
-
 # --- 单元测试/用法示例 ---
 if __name__ == "__main__":
     # 1. 创建一个具有特定秩的合成矩阵来测试
