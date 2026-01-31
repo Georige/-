@@ -3,49 +3,50 @@ from scipy import linalg
 import time
 import matplotlib.pyplot as plt
 from typing import Tuple, List, Dict
+from randomized_svd import randomized_svd
 
 # ==========================================
 # 模块 1: 核心算法实现
 # ==========================================
 
-def randomized_svd(A: np.ndarray, n_components: int, oversample: int = 5) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    随机化 SVD 分解。
+# def randomized_svd(A: np.ndarray, n_components: int, oversample: int = 5) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+#     """
+#     随机化 SVD 分解。
     
-    参数:
-    A: 输入矩阵
-    n_components: 目标秩 (我们希望提取多少个主要成分)
-    oversample: 过采样参数，用于提高精度，通常 5-10 足够
-    """
-    M, N = A.shape
+#     参数:
+#     A: 输入矩阵
+#     n_components: 目标秩 (我们希望提取多少个主要成分)
+#     oversample: 过采样参数，用于提高精度，通常 5-10 足够
+#     """
+#     M, N = A.shape
     
-    # 随机投影矩阵 Omega
-    # 维度说明: Omega 是 (N x (k + p))
-    k = n_components
-    p = oversample
-    Omega = np.random.randn(N, k + p)
+#     # 随机投影矩阵 Omega
+#     # 维度说明: Omega 是 (N x (k + p))
+#     k = n_components
+#     p = oversample
+#     Omega = np.random.randn(N, k + p)
     
-    # 1. 计算草图矩阵 (Sketch) Y = A @ Omega
-    Y = A @ Omega
+#     # 1. 计算草图矩阵 (Sketch) Y = A @ Omega
+#     Y = A @ Omega
     
-    # 2. QR 分解获取正交基 Q
-    Q, _ = linalg.qr(Y, mode='economic')
+#     # 2. QR 分解获取正交基 Q
+#     Q, _ = linalg.qr(Y, mode='economic')
     
-    # 3. 投影原矩阵 B = Q.T @ A
-    B = Q.T @ A
+#     # 3. 投影原矩阵 B = Q.T @ A
+#     B = Q.T @ A
     
-    # 4. 在小矩阵 B 上做标准 SVD
-    U_tilde, S, Vt = linalg.svd(B, full_matrices=False)
+#     # 4. 在小矩阵 B 上做标准 SVD
+#     U_tilde, S, Vt = linalg.svd(B, full_matrices=False)
     
-    # 5. 还原 U = Q @ U_tilde
-    U = Q @ U_tilde
+#     # 5. 还原 U = Q @ U_tilde
+#     U = Q @ U_tilde
     
-    # 截断到目标秩 k
-    return U[:, :k], S[:k], Vt[:k, :]
+#     # 截断到目标秩 k
+#     return U[:, :k], S[:k], Vt[:k, :]
 
-# ==========================================
-# 模块 2: 统计型测试引擎
-# ==========================================
+# # ==========================================
+# # 模块 2: 统计型测试引擎
+# # ==========================================
 
 def get_stats_for_rank(matrix_size: int, rank: int, n_repeats: int) -> Dict[str, float]:
     """
@@ -71,7 +72,7 @@ def get_stats_for_rank(matrix_size: int, rank: int, n_repeats: int) -> Dict[str,
         # --- 测试 Randomized SVD ---
         # 注意：我们告诉 rSVD 目标秩就是当前的 rank
         t0 = time.perf_counter()
-        randomized_svd(A, n_components=rank)
+        randomized_svd(A,epsilon=1e-2)
         t1 = time.perf_counter()
         rsvd_times.append(t1 - t0)
         
