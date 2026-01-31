@@ -2,147 +2,181 @@ import numpy as np
 from scipy import linalg
 import time
 import matplotlib.pyplot as plt
-from typing import Tuple, List
+from typing import Tuple, List, Dict
 
 # ==========================================
-# 模块 1: 算法实现
+# 模块 1: 核心算法实现
 # ==========================================
 
-def randomized_svd(A: np.ndarray, epsilon: float = 1e-2) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def randomized_svd(A: np.ndarray, n_components: int, oversample: int = 5) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    使用随机化方法计算矩阵的SVD分解。
+    随机化 SVD 分解。
     
     参数:
-    A (np.ndarray): 输入矩阵 (M x N)
-    epsilon (float): 用于确定目标秩的冗余量 (这里简化实现，将其作为过采样参数)
-    
-    返回:
-    U, S, Vt: SVD 分解的结果
+    A: 输入矩阵
+    n_components: 目标秩 (我们希望提取多少个主要成分)
+    oversample: 过采样参数，用于提高精度，通常 5-10 足够
     """
     M, N = A.shape
     
-    # 1. 确定目标秩 k。在实际应用中，k 应该比矩阵的有效秩略大。
-    # 为了简化，我们假设我们想提取前 k 个主成分。这里动态设置为 min(M, N) 的一部分。
-    k = max(1, int(min(M, N) * 0.5)) # 假设截断到 50% 的秩
-    
-    # 过采样参数，增加随机矩阵的列数以提高精度
-    p = 5 
-    
-    # 2. 生成随机高斯矩阵 Omega (N x (k+p))
+    # 随机投影矩阵 Omega
+    # 维度说明: Omega 是 (N x (k + p))
+    k = n_components
+    p = oversample
     Omega = np.random.randn(N, k + p)
     
-    # 3. 构造子空间 Y = A * Omega (M x (k+p))
+    # 1. 计算草图矩阵 (Sketch) Y = A @ Omega
     Y = A @ Omega
     
-    # 4. 对 Y 进行 QR 分解，得到正交基 Q
+    # 2. QR 分解获取正交基 Q
     Q, _ = linalg.qr(Y, mode='economic')
     
-    # 5. 投影到子空间: B = Q.T * A (k+p x N)
+    # 3. 投影原矩阵 B = Q.T @ A
     B = Q.T @ A
     
-    # 6. 对小矩阵 B 进行标准 SVD
+    # 4. 在小矩阵 B 上做标准 SVD
     U_tilde, S, Vt = linalg.svd(B, full_matrices=False)
     
-    # 7. 恢复 U = Q * U_tilde
+    # 5. 还原 U = Q @ U_tilde
     U = Q @ U_tilde
     
-    # 根据 k 截断返回
+    # 截断到目标秩 k
     return U[:, :k], S[:k], Vt[:k, :]
 
-
 # ==========================================
-# 模块 2: 数据生成与测试引擎
+# 模块 2: 统计型测试引擎
 # ==========================================
 
-def generate_rank_k_matrix(m: int, n: int, rank: int) -> np.ndarray:
+def get_stats_for_rank(matrix_size: int, rank: int, n_repeats: int) -> Dict[str, float]:
     """
-    生成一个大小为 m x n 且精确秩为 rank 的矩阵。
+    针对特定的矩阵大小和特定的秩，重复运行 n_repeats 次实验，
+    返回平均耗时。
     """
-    # 通过两个随机矩阵相乘生成：(m x rank) @ (rank x n)
-    U = np.random.randn(m, rank)
-    V = np.random.randn(rank, n)
-    return U @ V
-
-def run_benchmark(matrix_size: int, num_trials: int = 1500):
-    """
-    针对特定尺寸的矩阵运行基准测试，秩随试验次数线性增加。
-    """
-    print(f"\n--- 开始实验: 矩阵大小 {matrix_size}x{matrix_size}, 试验次数 {num_trials} ---")
-    
     svd_times = []
     rsvd_times = []
-    ranks = []
     
-    total_svd_time = 0.0
-    total_rsvd_time = 0.0
-
-    # 预热 (Warm-up): 避免 Python 的首次加载开销影响时间统计
-    dummy = np.random.randn(matrix_size, matrix_size)
-    linalg.svd(dummy)
-    randomized_svd(dummy)
-
-    for i in range(num_trials):
-        # 秩随着迭代次数从 1 线性增加到 max_rank
-        current_rank = max(1, int((i / (num_trials - 1)) * matrix_size))
-        ranks.append(current_rank)
+    for _ in range(n_repeats):
+        # 每次都生成一个新的随机矩阵，避免缓存命中带来的偏差
+        # 生成方法：A (size x size) = U (size x rank) @ V (rank x size)
+        U_gen = np.random.randn(matrix_size, rank)
+        V_gen = np.random.randn(rank, matrix_size)
+        A = U_gen @ V_gen
         
-        A = generate_rank_k_matrix(matrix_size, matrix_size, current_rank)
-        
-        # 测试标准 SVD
-        start_time = time.perf_counter()
+        # --- 测试 Standard SVD ---
+        t0 = time.perf_counter()
         linalg.svd(A, full_matrices=False)
-        svd_time = time.perf_counter() - start_time
-        svd_times.append(svd_time)
-        total_svd_time += svd_time
+        t1 = time.perf_counter()
+        svd_times.append(t1 - t0)
         
-        # 测试 rSVD
-        start_time = time.perf_counter()
-        randomized_svd(A)
-        rsvd_time = time.perf_counter() - start_time
-        rsvd_times.append(rsvd_time)
-        total_rsvd_time += rsvd_time
+        # --- 测试 Randomized SVD ---
+        # 注意：我们告诉 rSVD 目标秩就是当前的 rank
+        t0 = time.perf_counter()
+        randomized_svd(A, n_components=rank)
+        t1 = time.perf_counter()
+        rsvd_times.append(t1 - t0)
+        
+    return {
+        "svd_mean": np.mean(svd_times),
+        "svd_std": np.std(svd_times),
+        "rsvd_mean": np.mean(rsvd_times),
+        "rsvd_std": np.std(rsvd_times)
+    }
 
-        if (i + 1) % 300 == 0:
-            print(f"  已处理 {i + 1} 个矩阵...")
-
-    print(f"总计耗时 (Standard SVD): {total_svd_time:.4f} 秒")
-    print(f"总计耗时 (Randomized SVD): {total_rsvd_time:.4f} 秒")
+def run_comprehensive_benchmark(matrix_size: int, total_experiments: int):
+    """
+    运行综合基准测试。
+    为了保证实验总数达到 total_experiments (例如 1500)，
+    我们需要规划采样的秩点数 (steps) 和每个点的重复次数 (repeats)。
+    """
+    print(f"\n====== 开始大规模实验: Matrix {matrix_size}x{matrix_size} ======")
     
-    return ranks, svd_times, rsvd_times
+    # 策略：我们不测试每一个整数秩，而是采样大约 20-50 个不同的秩点
+    # 这样每个点可以重复运行几十次，以获得准确的平均值
+    
+    num_rank_points = 30  # X轴上有30个数据点
+    repeats_per_rank = total_experiments // num_rank_points # 每个点重复大概 50 次
+    
+    # 生成要测试的 rank 列表 (从 2 到 matrix_size，均匀分布)
+    ranks_to_test = np.linspace(2, matrix_size, num_rank_points, dtype=int)
+    # 确保秩不重复且有效
+    ranks_to_test = np.unique(ranks_to_test)
+    
+    results = {
+        "ranks": [],
+        "svd_mean": [], "svd_std": [],
+        "rsvd_mean": [], "rsvd_std": []
+    }
+    
+    print(f"计划测试 {len(ranks_to_test)} 个不同的秩，每个秩重复 {repeats_per_rank} 次实验...")
+    
+    for r in ranks_to_test:
+        stats = get_stats_for_rank(matrix_size, int(r), repeats_per_rank)
+        
+        results["ranks"].append(r)
+        results["svd_mean"].append(stats["svd_mean"])
+        results["svd_std"].append(stats["svd_std"])
+        results["rsvd_mean"].append(stats["rsvd_mean"])
+        results["rsvd_std"].append(stats["rsvd_std"])
+        
+        # 简单的进度条
+        print(f"Rank {r:3d}: SVD Avg={stats['svd_mean']:.5f}s | rSVD Avg={stats['rsvd_mean']:.5f}s")
+
+    return results
 
 # ==========================================
-# 模块 3: 可视化
+# 模块 3: 专业级可视化
 # ==========================================
 
-def plot_results(ranks: List[int], svd_times: List[float], rsvd_times: List[float], matrix_size: int):
-    """
-    绘制随秩增加，耗时变化的图表。
-    这里我们使用移动平均法(Moving Average)平滑曲线，以便观察趋势。
-    """
-    window_size = 50 # 平滑窗口
-    svd_smooth = np.convolve(svd_times, np.ones(window_size)/window_size, mode='valid')
-    rsvd_smooth = np.convolve(rsvd_times, np.ones(window_size)/window_size, mode='valid')
-    ranks_smooth = ranks[:len(svd_smooth)]
-
-    plt.figure(figsize=(10, 6))
-    plt.plot(ranks_smooth, svd_smooth, label='Standard SVD', color='blue', alpha=0.7)
-    plt.plot(ranks_smooth, rsvd_smooth, label='Randomized SVD', color='red', alpha=0.7)
+def plot_benchmark_results(results: Dict, matrix_size: int):
+    ranks = np.array(results["ranks"])
+    svd_mean = np.array(results["svd_mean"])
+    svd_std = np.array(results["svd_std"])
+    rsvd_mean = np.array(results["rsvd_mean"])
+    rsvd_std = np.array(results["rsvd_std"])
     
-    plt.title(f'SVD vs Randomized SVD Execution Time ({matrix_size}x{matrix_size})')
-    plt.xlabel('Matrix Rank')
-    plt.ylabel('Execution Time (seconds) - Smoothed')
-    plt.legend()
-    plt.grid(True)
+    plt.figure(figsize=(12, 7))
+    
+    # 绘制标准 SVD 曲线
+    plt.plot(ranks, svd_mean, 'o-', label='Standard SVD (Mean)', color='blue', markersize=4)
+    # 绘制误差带 (Mean ± 1 Std Dev)
+    plt.fill_between(ranks, svd_mean - svd_std, svd_mean + svd_std, color='blue', alpha=0.15)
+    
+    # 绘制 rSVD 曲线
+    plt.plot(ranks, rsvd_mean, 's-', label='Randomized SVD (Mean)', color='red', markersize=4)
+    plt.fill_between(ranks, rsvd_mean - rsvd_std, rsvd_mean + rsvd_std, color='red', alpha=0.15)
+    
+    plt.title(f'Performance Comparison: SVD vs rSVD ({matrix_size}x{matrix_size})\n(Averaged over repeated trials)', fontsize=14)
+    plt.xlabel('Matrix Rank', fontsize=12)
+    plt.ylabel('Average Execution Time (seconds)', fontsize=12)
+    plt.legend(fontsize=12)
+    plt.grid(True, which='both', linestyle='--', alpha=0.7)
+    
+    # 在图上标注加速比
+    speedup = svd_mean[-1] / rsvd_mean[-1]
+    plt.annotate(f'Max Rank Speedup: {speedup:.1f}x', 
+                 xy=(ranks[-1], rsvd_mean[-1]), 
+                 xytext=(ranks[-1] - (ranks[-1]*0.3), rsvd_mean[-1] + (svd_mean[-1]*0.1)),
+                 arrowprops=dict(facecolor='black', shrink=0.05))
+
+    plt.tight_layout()
     plt.show()
 
 # ==========================================
-# 主程序执行入口
+# 主程序入口
 # ==========================================
 if __name__ == "__main__":
-    # 实验 1: 16x16 小规模矩阵
-    ranks_16, svd_16, rsvd_16 = run_benchmark(matrix_size=16, num_trials=1500)
-    plot_results(ranks_16, svd_16, rsvd_16, matrix_size=16)
-
-    # 实验 2: 512x512 大规模矩阵
-    ranks_512, svd_512, rsvd_512 = run_benchmark(matrix_size=512, num_trials=1500)
-    plot_results(ranks_512, svd_512, rsvd_512, matrix_size=512)
+    # 预热 (Warm-up)
+    print("正在进行系统预热...")
+    dummy = np.random.randn(100, 100)
+    linalg.svd(dummy)
+    randomized_svd(dummy, 10)
+    
+    # 实验 1: 16x16 矩阵 (共1500次实验)
+    # 小矩阵我们可能会发现 rSVD 并不占优势，因为 overhead 占比大
+    results_16 = run_comprehensive_benchmark(matrix_size=16, total_experiments=1500)
+    plot_benchmark_results(results_16, matrix_size=16)
+    
+    # 实验 2: 512x512 矩阵 (共1500次实验)
+    # 这里我们应该能看到 rSVD 的显著优势
+    results_512 = run_comprehensive_benchmark(matrix_size=512, total_experiments=1500)
+    plot_benchmark_results(results_512, matrix_size=512)
